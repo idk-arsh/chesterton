@@ -6,7 +6,7 @@
 mode: speedbump
 
 # How far back to look for fix commits: all, or a span like 3y, 18m, 6w, 90d.
-history: 3y
+history: all
 
 # Hard cap on commits walked when building the index.
 max_commits: 20000

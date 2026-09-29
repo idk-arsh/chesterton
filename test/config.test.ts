@@ -4,6 +4,13 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG, loadConfig, loadConfigWithWarnings, parseConfig, parseYamlSubset } from "../src/config.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
 
+describe("DEFAULT_CONFIG", () => {
+  it("indexes all history by default, capped by maxCommits", () => {
+    expect(DEFAULT_CONFIG.history).toBe("all");
+    expect(DEFAULT_CONFIG.maxCommits).toBe(20_000);
+  });
+});
+
 describe("parseYamlSubset", () => {
   it("reads scalars, quoted strings, inline and block lists, and comments", () => {
     const { values, warnings } = parseYamlSubset(
@@ -98,7 +105,7 @@ describe("parseConfig", () => {
     for (const h of ["90d", "6w", "18m", "3Y"]) {
       expect(parseConfig(`history: ${h}`).config.history).toBe(h.toLowerCase());
     }
-    expect(parseConfig("history: 0y").config.history).toBe("3y");
+    expect(parseConfig("history: 0y").config.history).toBe("all");
   });
 
   it("treats a scalar protect as a one-item list", () => {

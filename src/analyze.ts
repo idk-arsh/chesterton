@@ -4,6 +4,7 @@ import type { BlameLine, ChestertonConfig, ChestertonIndex, EditChange, FileFixR
 import { hashLine, isTrivial, normalizeLine, splitLines } from "./normalize.js";
 import { blameRange } from "./blame.js";
 import { recordsForFile } from "./index-store.js";
+import { isNoiseFile, isTestFile } from "./classify.js";
 
 /** How many lines around a removed line count as "next to" a line the fix added. */
 const NEAR = 3;
@@ -52,6 +53,17 @@ function readCurrent(repoRoot: string, relPath: string): string | null {
   }
 }
 
+/**
+ * True when the change only re-wraps or re-indents: the removed text and the added text are the
+ * same once all whitespace is deleted.
+ */
+export function isWhitespaceReflow(change: EditChange): boolean {
+  if (change.isNewFile || change.removed.length === 0 || change.added.length === 0) return false;
+  const squash = (lines: string[]) => lines.join("").replace(/\s+/g, "");
+  const before = squash(change.removed.map((r) => r.text));
+  return before.length > 0 && before === squash(change.added);
+}
+
 /** Merge [start, end] windows that touch or overlap. */
 function mergeRanges(ranges: [number, number][]): [number, number][] {
   const sorted = [...ranges].sort((x, y) => x[0] - y[0]);
@@ -75,6 +87,9 @@ export function analyzeChange(
   cfg: ChestertonConfig,
   deps: AnalyzeDeps = {},
 ): Finding[] {
+  // Docs, changelogs, CI config and lockfiles are never indexed or checked.
+  if (isNoiseFile(change.relPath)) return [];
+  if (isWhitespaceReflow(change)) return [];
   const records = recordsForFile(idx, change.relPath).filter(
     (r) => idx.commits[r.sha] && !isIgnored(r.sha, cfg) && !isPureMove(r),
   );
@@ -87,7 +102,12 @@ export function analyzeChange(
     const removed = change.removed
       .map((r) => ({ ...r, norm: normalizeLine(r.text) }))
       .filter((r) => !isTrivial(r.norm));
-    if (removed.length > 0) hits.push(...removesFix(repoRoot, change, removed, records, idx, cfg, deps, currentLines.length));
+    if (removed.length > 0) {
+      const found = removesFix(repoRoot, change, removed, records, idx, cfg, deps, currentLines.length);
+      // Reworking a fix's own test is not a reason to stop: removals in test files stay weak.
+      if (isTestFile(change.relPath)) for (const h of found) h.strength = "weak";
+      hits.push(...found);
+    }
   }
 
   // re-adds-removed

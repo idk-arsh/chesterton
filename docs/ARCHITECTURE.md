@@ -50,7 +50,7 @@ export function buildIndex(repoRoot: string, cfg: ChestertonConfig, opts?: Build
 //   Incremental when a saved index exists and its head is an ancestor of HEAD; otherwise full.
 //   Uses a lock file in indexDir so two builds never run at once (second caller returns the existing index or waits briefly).
 //   Follows renames forward so records are keyed by the file's CURRENT path.
-//   Respects cfg.history, cfg.maxCommits, cfg.ignoreCommits. Skips merges, binary files, lockfiles.
+//   Respects cfg.history, cfg.maxCommits, cfg.ignoreCommits. Skips merges, binary files, and noise files (isNoiseFile).
 export function isIndexFresh(repoRoot: string, idx: ChestertonIndex | null): boolean; // idx.head === HEAD
 
 // src/blame.ts
@@ -124,11 +124,27 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
   - +1 message references an issue/PR (`#\d+`, `[A-Z]+-\d+`, a github/gitlab/jira URL)
   - +2 the commit adds or modifies a test file (`test/`, `tests/`, `__tests__/`, `spec/`, `*_test.*`, `*.test.*`, `*.spec.*`, `test_*.py`)
   - +1 small change (<= 5 files and <= 60 changed lines)
-  - -5 merge commit, -5 only lockfiles/deps/formatting/docs, -3 more than 40 files
+  - -5 merge commit, -5 only lockfiles/deps/formatting/docs/CI, -3 more than 40 files or 1500 lines
   - cfg.fixPatternsExtra regexes count like the keyword rule
+- isFix also needs (index version 2):
+  - a **fix signal**: the keyword rule, conventional `fix:`, or a fixPatternsExtra match. Refs, tests and size only add score.
+  - not **demoted**: `fix(deps|devdeps|dev-deps|ci|build|refactor|docs|lint|style|typo|test|tests):`, `build(deps):`, `deps:`,
+    `docs:`/`style:`/`lint:`/`ci:`/`test:`/`refactor:` types, `pkg@1.2.3` subjects, `chore:` unless it names race/crash/leak/regression/cve,
+    subjects with bump, dependency updates, typo, spelling, codespell, lint, formatting/reformat, whitespace.
+    A subject starting with a feature verb (add, support, implement, allow, introduce, feat, feature, new, enable) needs fix wording
+    in the subject itself ("Fixes #N" closers do not count). Refactor verbs (refactor, rename, clean up, tidy, reorganize) are the
+    same, except a strong keyword anywhere in the message rescues them.
+  - **size veto**: at most 40 files and 1500 changed lines, not counting noise files (below).
+  - **reverts**: "revert" is not a fix signal by itself and the quoted reverted subject is ignored; a revert counts only with its own
+    fix wording or an issue ref. `Revert "Revert ...` is never a fix.
+- Noise files (`isNoiseFile` in classify.ts) are never indexed and never checked: docs and changelogs (`*.md`, `*.rst`, `*.txt`,
+  `*.adoc`, `History*`, `CHANGELOG*`, `README*`, `LICENSE*` ..., root `docs/` and `doc/`), CI config (`.github/`, `.gitlab-ci.yml`,
+  `.travis.yml`, `appveyor.yml`, `.circleci/`, `azure-pipelines.yml`, `.pre-commit-config.yaml`), and lockfiles.
 - `removes-fix` strong: a removed line's blame points at fix commit F and F's `added` contains that line's hash.
   weak: the removed line was last touched by F but hash not in F.added, or within 3 lines of a line F added.
+  Removals in test files are always weak.
+- A change whose removed and added text are identical once all whitespace is deleted (a reflow) yields no findings.
 - `re-adds-removed` strong: 2+ consecutive non-trivial added lines whose hashes appear in one fix commit's `removed` for this file (or its old paths), in order.
   weak: exactly 1 non-trivial added line of length >= 25 chars matches.
-- Only non-trivial lines count (`isTrivial`).
+- Only non-trivial lines count (`isTrivial`). Besides braces, keywords and imports, this covers `const x = require(...)`, version pins (`"pkg": "^1.2.3",`, `version = "..."`, `pkg>=1,<2`, `uses: owner/action@v4`) and lone `"string",` list entries.
 - A fix whose own removed lines equal its added lines (pure moves) contributes nothing.

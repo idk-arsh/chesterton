@@ -42,7 +42,7 @@ export interface FileFixRecord {
 }
 
 export interface ChestertonIndex {
-  version: 1;
+  version: typeof INDEX_VERSION;
   /** HEAD sha the index was built at. */
   head: string;
   builtAt: string;
@@ -113,4 +113,4 @@ export interface ChestertonConfig {
 }
 
 export const FIX_THRESHOLD = 3;
-export const INDEX_VERSION = 1 as const;
+export const INDEX_VERSION = 2 as const;

@@ -4,7 +4,7 @@ import type { ChestertonConfig, Mode } from "./types.js";
 
 export const DEFAULT_CONFIG: ChestertonConfig = {
   mode: "speedbump",
-  history: "3y",
+  history: "all",
   maxCommits: 20_000,
   protect: [],
   fixPatternsExtra: [],

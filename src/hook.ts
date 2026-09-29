@@ -5,6 +5,7 @@ import { appendFileSync, existsSync, readFileSync, realpathSync } from "node:fs"
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BlameLine, ChestertonConfig, ChestertonIndex, EditChange, Finding, FixCommit, LineEntry } from "./types.js";
+import { INDEX_VERSION } from "./types.js";
 import { hashLine, isTrivial, normalizeLine, splitLines } from "./normalize.js";
 import { repoRoot as findRepoRoot, runGit } from "./git.js";
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
@@ -235,12 +236,12 @@ export function addedLinesInCommit(root: string, sha: string, path: string, time
 function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfig, deadline: Deadline): Finding[] {
   if (change.isNewFile || change.removed.length === 0) return [];
   const blame = memoBlame(deadline);
-  const empty: ChestertonIndex = { version: 1, head: "", builtAt: "", commits: {}, files: {} };
+  const empty: ChestertonIndex = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: {} };
   const removalOnly: EditChange = { ...change, added: [] };
   // First pass only collects blame.
   analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn });
 
-  const idx: ChestertonIndex = { version: 1, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
+  const idx: ChestertonIndex = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
   let n = 0;
   for (const sha of blame.shas) {
     if (n++ >= MAX_FALLBACK_COMMITS) break;

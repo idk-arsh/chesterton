@@ -30,6 +30,25 @@ const cfg = (over: Partial<ChestertonConfig> = {}): ChestertonConfig => ({ ...DE
 const parse = (s: string | null) => (s === null ? null : (JSON.parse(s).hookSpecificOutput as Record<string, string>));
 
 describe("decidePreToolUse", () => {
+  it("does not re-list test files beyond the cap", () => {
+    const tests = Array.from({ length: 12 }, (_, i) => `tests/test_${i}.py`);
+    const f = finding("strong");
+    f.fix.testFiles = tests;
+    f.fix.reasons = ["message says 'fix'", "modifies test tests/test_0.py", "modifies test tests/test_1.py", "modifies test tests/test_2.py", "and 9 more test files"];
+    const reason = parse(decidePreToolUse([f], fresh(), cfg(), "src/sock.ts").stdout)!.permissionDecisionReason!;
+    expect(reason).toContain("and 9 more test files");
+    expect(reason).not.toContain("tests/test_3.py");
+    expect(reason).not.toContain("touches test");
+
+    // With no test reasons from the classifier, list at most 3 and count the rest.
+    const g = finding("strong");
+    g.fix.testFiles = tests;
+    g.fix.reasons = ["message says 'fix'"];
+    const r2 = parse(decidePreToolUse([g], fresh(), cfg(), "src/sock.ts").stdout)!.permissionDecisionReason!;
+    expect(r2).toContain("touches test tests/test_0.py, tests/test_1.py, tests/test_2.py and 9 more");
+    expect(r2).not.toContain("tests/test_3.py");
+  });
+
   it("silent with no findings", () => {
     expect(decidePreToolUse([], fresh(), cfg(), "src/sock.ts")).toEqual({ stdout: null });
   });

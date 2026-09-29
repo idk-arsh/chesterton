@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { main, parseFileLine, VERSION, type CliIO } from "../src/cli.js";
+import { formatFinding, main, parseFileLine, VERSION, type CliIO } from "../src/cli.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
 
 function run(argv: string[], cwd: string): { code: number; out: string; err: string } {
@@ -37,6 +37,29 @@ function fixtureRepo(): TestRepo {
 }
 
 const SIMPLIFIED = ["export async function close(sock) {", "  await sock.flush();", "  sock.end();", "}", ""].join("\n");
+
+describe("formatFinding", () => {
+  it("caps the Tests list at 3 plus a count", () => {
+    const out = formatFinding({
+      kind: "removes-fix",
+      strength: "strong",
+      file: "src/a.py",
+      lines: ["x = guard(y)"],
+      fix: {
+        sha: "a".repeat(40),
+        date: "2025-01-01T00:00:00Z",
+        author: "Jane",
+        subject: "Fix CI and build failures (#7190)",
+        score: 6,
+        reasons: ["message says 'fix'"],
+        refs: ["#7190"],
+        testFiles: ["t/1.py", "t/2.py", "t/3.py", "t/4.py", "t/5.py"],
+      },
+    });
+    expect(out).toContain("  Tests: t/1.py, t/2.py, t/3.py and 2 more");
+    expect(out).not.toContain("t/4.py");
+  });
+});
 
 describe("cli basics", () => {
   it("prints the version, matching package.json", () => {

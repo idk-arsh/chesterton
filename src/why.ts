@@ -4,6 +4,7 @@ import { runGit } from "./git.js";
 import { hashLine, isTrivial, normalizeLine, splitLines, toPosix } from "./normalize.js";
 import { blameAt } from "./diff-change.js";
 import type { ChestertonIndex, FixCommit } from "./types.js";
+import { capList } from "./decide.js";
 
 const ZERO_SHA = /^0+$/;
 const HISTORY_LIMIT = 10;
@@ -112,7 +113,7 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
 function describeFix(f: FixCommit, pad: string): string[] {
   const lines = [`${pad}Looks like a bug fix (score ${f.score}): ${f.reasons.join("; ") || "classifier score"}`];
   if (f.refs.length) lines.push(`${pad}Refs: ${f.refs.join(", ")}`);
-  if (f.testFiles.length) lines.push(`${pad}Tests: ${f.testFiles.join(", ")}`);
+  if (f.testFiles.length) lines.push(`${pad}Tests: ${capList(f.testFiles)}`);
   return lines;
 }
 

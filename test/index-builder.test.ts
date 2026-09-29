@@ -226,6 +226,33 @@ describe("buildIndex", () => {
     expect(Object.keys(idx.files)).toEqual(["src/x.ts"]);
   });
 
+  it("skips docs, changelogs and CI config", () => {
+    const r = repo();
+    r.write("README.md", "Intro line for the readme\n");
+    r.write("History.md", "1.0.0 first release notes\n");
+    r.write("docs/guide.rst", "How to use the thing\n");
+    r.write(".github/workflows/ci.yml", "name: ci pipeline\n");
+    r.write(".travis.yml", "language: node_js\n");
+    r.write("src/x.ts", "export const x = 1;\n");
+    r.commit("initial");
+    r.write("README.md", "Intro line for the readme\nFixed the crash with bad x\n");
+    r.write("History.md", "1.0.1 fixed a crash with bad x\n");
+    r.write("docs/guide.rst", "How to use the thing without crashing\n");
+    r.write(".github/workflows/ci.yml", "name: ci pipeline with node 20\n");
+    r.write(".travis.yml", "language: node_js again\n");
+    r.write("src/x.ts", "export const x = 1;\nassertPositive(x);\n");
+    r.commit("fix: crash with bad x");
+    const idx = buildIndex(r.dir, cfg);
+    expect(Object.keys(idx.files)).toEqual(["src/x.ts"]);
+  });
+
+  it("writes index version 2", () => {
+    const r = repo();
+    r.write("a.ts", "export const v = 1;\n");
+    r.commit("initial");
+    expect(buildIndex(r.dir, cfg).version).toBe(2);
+  });
+
   it("respects ignoreCommits and maxCommits", () => {
     const r = repo();
     r.write("a.ts", "export const v = 1;\n");
