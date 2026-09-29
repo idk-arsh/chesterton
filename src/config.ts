@@ -14,6 +14,14 @@ export const DEFAULT_CONFIG: ChestertonConfig = {
 
 export const CONFIG_FILE = ".chesterton.yml";
 
+/**
+ * Largest accepted hook_timeout_ms. hooks/hooks.json gives PreToolUse 5 s and Stop 15 s; the edit
+ * check must finish (plus Node startup) inside 5 s, and the Stop sweep gets 3x this budget.
+ * Higher values are capped so Claude Code never kills the hook mid-run and reports an error.
+ */
+export const MAX_HOOK_TIMEOUT_MS = 4_000;
+export const MIN_HOOK_TIMEOUT_MS = 100;
+
 const MODES: readonly Mode[] = ["speedbump", "ask", "warn-only"];
 
 export type YamlValue = string | string[];
@@ -195,8 +203,11 @@ export function parseConfig(text: string): { config: ChestertonConfig; warnings:
       }
       case "hook_timeout_ms": {
         const n = asInt(value);
-        if (n !== null && n >= 100 && n <= 60_000) cfg.hookTimeoutMs = n;
-        else bad(key, "expected a whole number between 100 and 60000");
+        if (n !== null && n >= MIN_HOOK_TIMEOUT_MS && n <= MAX_HOOK_TIMEOUT_MS) cfg.hookTimeoutMs = n;
+        else if (n !== null && n > MAX_HOOK_TIMEOUT_MS) {
+          cfg.hookTimeoutMs = MAX_HOOK_TIMEOUT_MS;
+          warnings.push(`hook_timeout_ms: ${n} is more than the hook timeout allows, capped at ${MAX_HOOK_TIMEOUT_MS}`);
+        } else bad(key, `expected a whole number between ${MIN_HOOK_TIMEOUT_MS} and ${MAX_HOOK_TIMEOUT_MS}`);
         break;
       }
       case "protect": {

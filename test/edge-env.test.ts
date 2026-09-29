@@ -134,12 +134,12 @@ describe("repo shapes", () => {
     expect(loadIndex(r.dir)?.head).toBe(r.git("rev-parse", "HEAD").trim());
   });
 
-  // BUG (wrong result): in a shallow clone the boundary commit looks like it added every line of every
+  // Was a bug (wrong result): in a shallow clone the boundary commit looks like it added every line of every
   // file. When that commit's message reads like a fix, every untouched line in the repo is treated as
   // "added by a fix" and any removal is a strong hit.
   // Repro: 6 commits growing lib.js, then "fix: crash on null input" adds one line, then an unrelated
   // commit; `git clone --depth 2`; `chesterton index`; delete any old line; `chesterton check` -> STRONG.
-  it.fails("shallow clone: boundary commit does not claim every line as a fix", () => {
+  it("shallow clone: boundary commit does not claim every line as a fix", () => {
     const src = track(makeRepo());
     const lines: string[] = [];
     for (let i = 1; i <= 6; i++) {
@@ -161,7 +161,9 @@ describe("repo shapes", () => {
     expect(out === null || decision(out) !== "deny").toBe(true);
   });
 
-  it("shallow clone: the real fix line is still caught", () => {
+  // The fix must sit above the boundary: a boundary commit has no visible parent, so what it really
+  // changed cannot be told apart from the rest of the tree, and it is never treated as a fix.
+  it("shallow clone: a fix inside the shallow history is still caught", () => {
     const src = track(makeRepo());
     src.write("lib.js", "const value1 = computeSomething(1);\n");
     src.commit("feature");
@@ -170,15 +172,15 @@ describe("repo shapes", () => {
     src.write("other.txt", "x\n");
     src.commit("docs tweak");
     const dir = join(tmp("chesterton-shallow2-"), "clone");
-    runGit(["-c", "core.autocrlf=false", "clone", "-q", "--depth", "2", pathToFileURL(src.dir).href, dir], process.cwd());
+    runGit(["-c", "core.autocrlf=false", "clone", "-q", "--depth", "3", pathToFileURL(src.dir).href, dir], process.cwd());
     buildIndex(dir, { ...DEFAULT_CONFIG }, { full: true });
     expect(decision(edit(dir, join(dir, "lib.js"), "const guardAgainstNull = input ?? defaults;\n", "", "s2"))).toBe("deny");
   });
 
-  // BUG (wrong result, silent miss): a file inside a submodule, edited from the parent repo's session,
+  // Was a bug (wrong result, silent miss): a file inside a submodule, edited from the parent repo's session,
   // is checked against the parent repo. The parent has no history for it, so a fix in the submodule is
   // never seen. The hook should resolve the repo from the file's own directory.
-  it.fails("submodule file edited from the parent repo is checked against the submodule history", () => {
+  it("submodule file edited from the parent repo is checked against the submodule history", () => {
     const sub = fixRepo();
     const parent = track(makeRepo());
     parent.write("README.md", "parent\n");
@@ -212,11 +214,11 @@ describe("repo shapes", () => {
     expect(decision(edit(moved, join(moved, "src", "sock.ts"), GUARD + "\n", ""))).toBe("deny");
   });
 
-  // BUG (wrong result, silent miss): git resolves junctions and symlinks in --show-toplevel, but the
+  // Was a bug (wrong result, silent miss): git resolves junctions and symlinks in --show-toplevel, but the
   // hook compares the tool's file_path (which uses the path the session was opened with) against it
   // without resolving links, so every edit looks like it is outside the repo. On macOS the same thing
   // happens for repos under /tmp or /var (symlinks to /private/...), and on Linux for symlinked homes.
-  it.fails("repo opened through a junction or symlink: deny still fires", () => {
+  it("repo opened through a junction or symlink: deny still fires", () => {
     const r = fixRepo();
     const link = join(tmp("chesterton-link-"), "linked");
     symlinkSync(r.dir, link, process.platform === "win32" ? "junction" : "dir");
@@ -260,10 +262,10 @@ describe("path shapes", () => {
     forms.forEach((f, i) => expect(decision(edit(r.dir, f, GUARD + "\n", "", `form${i}`))).toBe("deny"));
   });
 
-  // BUG (wrong result, low): on case-insensitive file systems (Windows, default macOS) a file_path whose
+  // Was a bug (wrong result, low): on case-insensitive file systems (Windows, default macOS) a file_path whose
   // directory or file name case differs from git's ("SRC/Sock.ts" for "src/sock.ts") reads fine from
   // disk but misses the index key and git blame, so the fix is not seen.
-  it.fails("file_path with different letter case on a case-insensitive file system still matches", () => {
+  it("file_path with different letter case on a case-insensitive file system still matches", () => {
     if (process.platform !== "win32" && process.platform !== "darwin") throw new Error("case-sensitive FS");
     const r = fixRepo();
     expect(decision(edit(r.dir, join(r.dir, "SRC", "Sock.ts"), GUARD + "\n", "", "case"))).toBe("deny");
@@ -341,9 +343,9 @@ describe("file contents", () => {
     expect(decision(write(r.dir, join(r.dir, "src", "sock.ts"), BEFORE.join("\n") + "\n"))).toBe("deny");
   });
 
-  // BUG (wrong result, silent miss): with mixed line endings, an old_string that spans a CRLF line
+  // Was a bug (wrong result, silent miss): with mixed line endings, an old_string that spans a CRLF line
   // and an LF line matches neither the as-is form nor the all-CRLF form, so the change is dropped.
-  it.fails("mixed line endings: an edit spanning CRLF and LF lines is still checked", () => {
+  it("mixed line endings: an edit spanning CRLF and LF lines is still checked", () => {
     const r = track(makeRepo());
     r.write("m.ts", "function close(sock) {\r\n  sock.end();\n}\r\n");
     r.commit("initial");

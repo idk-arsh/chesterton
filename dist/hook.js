@@ -2,8 +2,8 @@
 
 // src/hook.ts
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync as existsSync2, readFileSync as readFileSync7, realpathSync } from "node:fs";
-import { dirname, join as join6, resolve as resolve3 } from "node:path";
+import { appendFileSync, existsSync as existsSync3, readFileSync as readFileSync8, realpathSync as realpathSync2 } from "node:fs";
+import { dirname as dirname2, isAbsolute as isAbsolute4, join as join7, resolve as resolve5 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/normalize.ts
@@ -80,6 +80,8 @@ function toPosix(p) {
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 var GitError = class extends Error {
 };
 function runGit(args, cwd, timeoutMs = 1e4) {
@@ -109,9 +111,24 @@ function headSha(cwd, timeoutMs = 5e3) {
     return null;
   }
 }
+function shallowInfo(cwd, timeoutMs = 5e3) {
+  const boundary = /* @__PURE__ */ new Set();
+  try {
+    let p = runGit(["rev-parse", "--git-path", "shallow"], cwd, timeoutMs).trim();
+    if (!isAbsolute(p)) p = resolve(cwd, p);
+    if (!existsSync(p)) return { shallow: false, boundary };
+    for (const line of readFileSync(p, "utf8").split(/\r?\n/)) {
+      const sha = line.trim();
+      if (sha) boundary.add(sha);
+    }
+    return { shallow: boundary.size > 0, boundary };
+  } catch {
+    return { shallow: false, boundary };
+  }
+}
 
 // src/config.ts
-import { readFileSync } from "node:fs";
+import { readFileSync as readFileSync2 } from "node:fs";
 import { join } from "node:path";
 var DEFAULT_CONFIG = {
   mode: "speedbump",
@@ -123,6 +140,8 @@ var DEFAULT_CONFIG = {
   hookTimeoutMs: 1500
 };
 var CONFIG_FILE = ".chesterton.yml";
+var MAX_HOOK_TIMEOUT_MS = 4e3;
+var MIN_HOOK_TIMEOUT_MS = 100;
 var MODES = ["speedbump", "ask", "warn-only"];
 function parseYamlSubset(text) {
   const values = {};
@@ -271,8 +290,11 @@ function parseConfig(text) {
       }
       case "hook_timeout_ms": {
         const n = asInt(value);
-        if (n !== null && n >= 100 && n <= 6e4) cfg.hookTimeoutMs = n;
-        else bad(key, "expected a whole number between 100 and 60000");
+        if (n !== null && n >= MIN_HOOK_TIMEOUT_MS && n <= MAX_HOOK_TIMEOUT_MS) cfg.hookTimeoutMs = n;
+        else if (n !== null && n > MAX_HOOK_TIMEOUT_MS) {
+          cfg.hookTimeoutMs = MAX_HOOK_TIMEOUT_MS;
+          warnings.push(`hook_timeout_ms: ${n} is more than the hook timeout allows, capped at ${MAX_HOOK_TIMEOUT_MS}`);
+        } else bad(key, `expected a whole number between ${MIN_HOOK_TIMEOUT_MS} and ${MAX_HOOK_TIMEOUT_MS}`);
         break;
       }
       case "protect": {
@@ -311,7 +333,7 @@ function parseConfig(text) {
 function loadConfigWithWarnings(repoRoot2) {
   let text;
   try {
-    text = readFileSync(join(repoRoot2, CONFIG_FILE), "utf8");
+    text = readFileSync2(join(repoRoot2, CONFIG_FILE), "utf8");
   } catch {
     return { config: { ...DEFAULT_CONFIG, protect: [], fixPatternsExtra: [], ignoreCommits: [] }, warnings: [], found: false };
   }
@@ -330,8 +352,8 @@ function loadConfig(repoRoot2) {
 }
 
 // src/index-store.ts
-import { existsSync, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join as join2, resolve } from "node:path";
+import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync3, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/types.ts
 var FIX_THRESHOLD = 3;
@@ -342,29 +364,49 @@ var INDEX_FILE = "index.json";
 var dirCache = /* @__PURE__ */ new Map();
 function indexDir(repoRoot2) {
   const cached = dirCache.get(repoRoot2);
-  if (cached && existsSync(cached)) return cached;
+  if (cached && existsSync2(cached)) return cached;
   let gitDir;
   try {
     gitDir = runGit(["rev-parse", "--absolute-git-dir"], repoRoot2, 5e3).trim();
   } catch {
     gitDir = runGit(["rev-parse", "--git-dir"], repoRoot2, 5e3).trim();
   }
-  if (!isAbsolute(gitDir)) gitDir = resolve(repoRoot2, gitDir);
+  if (!isAbsolute2(gitDir)) gitDir = resolve2(repoRoot2, gitDir);
   const dir = join2(gitDir, "chesterton");
   mkdirSync(dir, { recursive: true });
   dirCache.set(repoRoot2, dir);
   return dir;
 }
+var isObj = (x) => !!x && typeof x === "object" && !Array.isArray(x);
+var isStrArr = (x) => Array.isArray(x) && x.every((v) => typeof v === "string");
+function isValidEntries(x) {
+  if (!Array.isArray(x)) return false;
+  for (const e of x) {
+    if (!isObj(e) || typeof e.hash !== "string" || typeof e.text !== "string" || typeof e.line !== "number") return false;
+  }
+  return true;
+}
+function isValidCommit(x) {
+  return isObj(x) && typeof x.sha === "string" && typeof x.date === "string" && typeof x.author === "string" && typeof x.subject === "string" && typeof x.score === "number" && isStrArr(x.reasons) && isStrArr(x.refs) && isStrArr(x.testFiles);
+}
+function isValidRecord(x) {
+  return isObj(x) && typeof x.sha === "string" && typeof x.path === "string" && (x.oldPath === void 0 || typeof x.oldPath === "string") && isValidEntries(x.added) && isValidEntries(x.removed);
+}
 function isValidIndex(x) {
-  if (!x || typeof x !== "object") return false;
-  const o = x;
-  return o.version === INDEX_VERSION && typeof o.head === "string" && typeof o.builtAt === "string" && !!o.commits && typeof o.commits === "object" && !!o.files && typeof o.files === "object";
+  if (!isObj(x)) return false;
+  if (x.version !== INDEX_VERSION || typeof x.head !== "string" || typeof x.builtAt !== "string") return false;
+  if (!isObj(x.commits) || !isObj(x.files)) return false;
+  for (const c of Object.values(x.commits)) if (!isValidCommit(c)) return false;
+  for (const recs of Object.values(x.files)) {
+    if (!Array.isArray(recs) || !recs.every(isValidRecord)) return false;
+  }
+  return true;
 }
 function loadIndex(repoRoot2) {
   try {
     const file = join2(indexDir(repoRoot2), INDEX_FILE);
-    if (!existsSync(file)) return null;
-    const parsed = JSON.parse(readFileSync2(file, "utf8"));
+    if (!existsSync2(file)) return null;
+    const parsed = JSON.parse(readFileSync3(file, "utf8"));
     return isValidIndex(parsed) ? parsed : null;
   } catch {
     return null;
@@ -563,6 +605,7 @@ ${body}` : subject;
 
 // src/index-builder.ts
 var STALE_LOCK_MS = 5 * 6e4;
+var MAX_LIVE_LOCK_MS = 30 * 6e4;
 var DEFAULT_TIMEOUT_MS = 5 * 6e4;
 var LOCKFILE_EXCLUDES = [
   "package-lock.json",
@@ -604,7 +647,7 @@ function isIndexFresh(repoRoot2, idx) {
 }
 
 // src/blame.ts
-import { readFileSync as readFileSync3, statSync } from "node:fs";
+import { readFileSync as readFileSync4, statSync } from "node:fs";
 import { join as join3 } from "node:path";
 var HEADER_RE = /^([0-9a-f]{40}|[0-9a-f]{64}) (\d+) (\d+)(?: (\d+))?$/;
 function parsePorcelain(out) {
@@ -635,7 +678,7 @@ function blameRange(repoRoot2, relPath, start, end, timeoutMs = 5e3) {
     const rel = toPosix(relPath).replace(/^(\.\/)+/, "");
     const full = join3(repoRoot2, rel);
     if (!statSync(full).isFile()) return [];
-    const lineCount = splitLines(readFileSync3(full, "utf8")).length;
+    const lineCount = splitLines(readFileSync4(full, "utf8")).length;
     const s = Math.max(1, Math.floor(start));
     const e = Math.min(lineCount, Math.floor(end));
     if (lineCount === 0 || s > e) return [];
@@ -647,8 +690,8 @@ function blameRange(repoRoot2, relPath, start, end, timeoutMs = 5e3) {
 }
 
 // src/edit-diff.ts
-import { readFileSync as readFileSync4, statSync as statSync2 } from "node:fs";
-import { isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
+import { lstatSync, readdirSync, readFileSync as readFileSync5, realpathSync, statSync as statSync2 } from "node:fs";
+import { basename as basename2, dirname, isAbsolute as isAbsolute3, join as join4, relative, resolve as resolve3 } from "node:path";
 var MAX_FILE_BYTES = 5 * 1024 * 1024;
 var MAX_EDIT_DISTANCE = 2e3;
 function diffLines(before, after) {
@@ -730,16 +773,71 @@ function myers(a, b, maxD) {
   }
   return ops.reverse();
 }
-function resolveRepoPath(repoRoot2, filePath) {
-  if (typeof filePath !== "string" || filePath.trim() === "") return null;
-  let p = filePath.trim();
+function toolPathToNative(p) {
   if (process.platform === "win32") {
     const m = /^\/([a-zA-Z])(\/.*)?$/.exec(p);
-    if (m) p = `${m[1]}:${m[2] ?? "/"}`;
+    if (m) return `${m[1]}:${m[2] ?? "/"}`;
   }
-  const abs = isAbsolute2(p) ? resolve2(p) : resolve2(repoRoot2, p);
-  const rel = relative(resolve2(repoRoot2), abs);
-  if (rel === "" || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute2(rel)) return null;
+  return p;
+}
+function realOr(p) {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return p;
+  }
+}
+function realPathOf(abs) {
+  try {
+    if (!lstatSync(abs).isSymbolicLink()) return realpathSync.native(abs);
+    return join4(realOr(dirname(abs)), basename2(abs));
+  } catch {
+  }
+  const rest = [];
+  let cur = abs;
+  for (; ; ) {
+    const up = dirname(cur);
+    rest.unshift(basename2(cur));
+    if (up === cur) return abs;
+    cur = up;
+    try {
+      return join4(realpathSync.native(cur), ...rest);
+    } catch {
+    }
+  }
+}
+function trueCase(rootReal, rel) {
+  if (process.platform !== "darwin") return rel;
+  const parts = rel.split(/[\\/]/);
+  let dir = rootReal;
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    let name = part;
+    try {
+      const names = readdirSync(dir);
+      if (!names.includes(part)) {
+        const lower = part.toLowerCase();
+        const hit = names.find((n) => n.toLowerCase() === lower);
+        if (hit) name = hit;
+        else return [...out, ...parts.slice(i)].join("/");
+      }
+    } catch {
+      return [...out, ...parts.slice(i)].join("/");
+    }
+    out.push(name);
+    dir = join4(dir, name);
+  }
+  return out.join("/");
+}
+function resolveRepoPath(repoRoot2, filePath) {
+  if (typeof filePath !== "string" || filePath.trim() === "") return null;
+  const p = toolPathToNative(filePath.trim());
+  const rootReal = realOr(resolve3(repoRoot2));
+  const abs = realPathOf(isAbsolute3(p) ? resolve3(p) : resolve3(repoRoot2, p));
+  let rel = relative(rootReal, abs);
+  if (rel === "" || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute3(rel)) return null;
+  rel = trueCase(rootReal, rel);
   const posix = toPosix(rel);
   if (posix === ".git" || posix.startsWith(".git/")) return null;
   return { abs, rel: posix };
@@ -753,7 +851,7 @@ function readText(abs) {
   }
   if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
   try {
-    const text = readFileSync4(abs, "utf8");
+    const text = readFileSync5(abs, "utf8");
     if (text.includes("\0")) return null;
     return text;
   } catch {
@@ -782,7 +880,42 @@ function applyEdit(content, e) {
     if (e.replace_all) return content.split(oldS).join(newS);
     return content.slice(0, idx) + newS + content.slice(idx + oldS.length);
   }
-  return null;
+  return applyEolInsensitive(content, e);
+}
+function applyEolInsensitive(content, e) {
+  const oldN = e.old_string.replace(/\r\n/g, "\n");
+  if (oldN === "") return null;
+  const map = [];
+  let norm = "";
+  for (let i = 0; i < content.length; i++) {
+    map.push(i);
+    if (content[i] === "\r" && content[i + 1] === "\n") {
+      norm += "\n";
+      i++;
+    } else {
+      norm += content[i];
+    }
+  }
+  map.push(content.length);
+  const starts = [];
+  let from = 0;
+  for (; ; ) {
+    const at = norm.indexOf(oldN, from);
+    if (at < 0) break;
+    starts.push(at);
+    if (!e.replace_all) break;
+    from = at + oldN.length;
+  }
+  if (starts.length === 0) return null;
+  let out = "";
+  let last = 0;
+  for (const s of starts) {
+    const start = map[s];
+    const end = map[s + oldN.length];
+    out += content.slice(last, start) + e.new_string;
+    last = end;
+  }
+  return out + content.slice(last);
 }
 function changeFromToolCall(repoRoot2, toolName, toolInput) {
   if (!toolInput || typeof toolInput !== "object") return [];
@@ -837,8 +970,8 @@ function changeFromToolCall(repoRoot2, toolName, toolInput) {
 }
 
 // src/analyze.ts
-import { readFileSync as readFileSync5 } from "node:fs";
-import { join as join4 } from "node:path";
+import { readFileSync as readFileSync6 } from "node:fs";
+import { join as join5 } from "node:path";
 var NEAR = 3;
 var MAX_LINES = 8;
 var WEAK_SINGLE_MIN = 25;
@@ -854,7 +987,7 @@ function isPureMove(r) {
 }
 function readCurrent(repoRoot2, relPath) {
   try {
-    return readFileSync5(join4(repoRoot2, relPath), "utf8");
+    return readFileSync6(join5(repoRoot2, relPath), "utf8");
   } catch {
     return null;
   }
@@ -1156,35 +1289,80 @@ function decidePreToolUse(findings, session, cfg, relPath) {
 }
 
 // src/session.ts
-import { mkdirSync as mkdirSync2, readFileSync as readFileSync6, renameSync as renameSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { join as join5 } from "node:path";
+import { createHash as createHash2 } from "node:crypto";
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync7, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as join6, resolve as resolve4 } from "node:path";
+var SAFE_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/;
+var HASHED_TAIL = /\.h[0-9a-f]{12}$/;
 function sanitizeSessionId(id) {
-  const s = String(id ?? "").replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 120);
-  return s || "default";
+  const raw = String(id ?? "");
+  if (raw === "") return "default";
+  if (SAFE_ID.test(raw) && !HASHED_TAIL.test(raw)) return raw;
+  const prefix = raw.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 100);
+  const hash = createHash2("sha1").update(raw, "utf8").digest("hex").slice(0, 12);
+  return `${prefix}.h${hash}`;
 }
 function sessionPath(repoRoot2, sessionId) {
-  return join5(indexDir(repoRoot2), "sessions", `${sanitizeSessionId(sessionId)}.json`);
+  return join6(indexDir(repoRoot2), "sessions", `${sanitizeSessionId(sessionId)}.json`);
+}
+function fallbackSessionPath(repoRoot2, sessionId) {
+  const key = createHash2("sha1").update(resolve4(repoRoot2), "utf8").digest("hex").slice(0, 16);
+  return join6(tmpdir(), "chesterton-sessions", key, `${sanitizeSessionId(sessionId)}.json`);
 }
 function strings(x) {
   return Array.isArray(x) ? x.filter((v) => typeof v === "string") : [];
 }
-function loadSession(repoRoot2, sessionId) {
-  const fresh = { sessionId, acknowledged: [], findings: [], files: [] };
+function readSessionFile(file) {
   try {
-    const raw = JSON.parse(readFileSync6(sessionPath(repoRoot2, sessionId), "utf8"));
-    if (!raw || typeof raw !== "object") return fresh;
+    const raw = JSON.parse(readFileSync7(file, "utf8"));
+    if (!raw || typeof raw !== "object") return null;
     const findings = Array.isArray(raw.findings) ? raw.findings.filter((f) => f && typeof f === "object" && typeof f.key === "string") : [];
-    return { sessionId, acknowledged: strings(raw.acknowledged), findings, files: strings(raw.files) };
+    return { acknowledged: strings(raw.acknowledged), findings, files: strings(raw.files) };
   } catch {
-    return fresh;
+    return null;
+  }
+}
+function loadSession(repoRoot2, sessionId) {
+  const s = { sessionId, acknowledged: [], findings: [], files: [] };
+  const parts = [];
+  try {
+    parts.push(readSessionFile(sessionPath(repoRoot2, sessionId)));
+  } catch {
+  }
+  parts.push(readSessionFile(fallbackSessionPath(repoRoot2, sessionId)));
+  for (const p of parts) {
+    if (!p) continue;
+    for (const a of p.acknowledged) if (!s.acknowledged.includes(a)) s.acknowledged.push(a);
+    for (const f of p.files) if (!s.files.includes(f)) s.files.push(f);
+    for (const f of p.findings) {
+      if (!s.findings.some((g) => g.at === f.at && g.key === f.key && g.decision === f.decision)) s.findings.push(f);
+    }
+  }
+  return s;
+}
+function writeAtomic(file, text) {
+  mkdirSync2(join6(file, ".."), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    writeFileSync2(tmp, text);
+    renameSync2(tmp, file);
+  } catch (err) {
+    try {
+      unlinkSync2(tmp);
+    } catch {
+    }
+    throw err;
   }
 }
 function saveSession(repoRoot2, s) {
-  const file = sessionPath(repoRoot2, s.sessionId);
-  mkdirSync2(join5(file, ".."), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync2(tmp, JSON.stringify(s));
-  renameSync2(tmp, file);
+  const text = JSON.stringify(s);
+  try {
+    writeAtomic(sessionPath(repoRoot2, s.sessionId), text);
+    return;
+  } catch {
+  }
+  writeAtomic(fallbackSessionPath(repoRoot2, s.sessionId), text);
 }
 
 // src/hook.ts
@@ -1213,14 +1391,14 @@ var MAX_FALLBACK_COMMITS = 6;
 var MAX_STOP_FILES = 25;
 function scriptDir() {
   try {
-    return dirname(fileURLToPath(import.meta.url));
+    return dirname2(fileURLToPath(import.meta.url));
   } catch {
     return process.cwd();
   }
 }
 function defaultSpawnIndexer(cliPath) {
   return (root) => {
-    if (!existsSync2(cliPath)) return;
+    if (!existsSync3(cliPath)) return;
     const child = spawn(process.execPath, [cliPath, "index", "--quiet"], {
       cwd: root,
       detached: true,
@@ -1236,7 +1414,7 @@ function logError(root, err) {
   if (!root || err instanceof HookTimeout) return;
   try {
     const msg = err instanceof Error ? err.stack ?? err.message : String(err);
-    appendFileSync(join6(indexDir(root), "chesterton.log"), `${(/* @__PURE__ */ new Date()).toISOString()} hook: ${msg}
+    appendFileSync(join7(indexDir(root), "chesterton.log"), `${(/* @__PURE__ */ new Date()).toISOString()} hook: ${msg}
 `);
   } catch {
   }
@@ -1249,10 +1427,11 @@ function handleHookInput(raw, deps = {}) {
     if (!input || typeof input !== "object") return null;
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
     root = repoRoot(cwd);
+    const event = input.hook_event_name;
+    if (event === "PreToolUse") root = rootForToolInput(input.tool_input, cwd, root);
     if (!root) return null;
     const cfg = loadConfig(root);
     const sessionId = typeof input.session_id === "string" && input.session_id ? input.session_id : "default";
-    const event = input.hook_event_name;
     if (event === "PreToolUse") {
       const deadline = new Deadline(startedAt + cfg.hookTimeoutMs);
       return preToolUse(root, cfg, sessionId, input, deadline);
@@ -1263,14 +1442,47 @@ function handleHookInput(raw, deps = {}) {
     if (event === "Stop") {
       if (input.stop_hook_active === true) return null;
       const deadline = new Deadline(startedAt + Math.max(cfg.hookTimeoutMs * 3, 3e3));
-      const out = stop(root, cfg, sessionId, deadline);
-      return deadline.remaining() > 0 ? out : null;
+      const res = stop(root, cfg, sessionId, deadline);
+      if (!res || deadline.remaining() <= 0) return null;
+      res.commit();
+      return res.text;
     }
     return null;
   } catch (err) {
     logError(root, err);
     return null;
   }
+}
+function rootForToolInput(toolInput, cwd, cwdRoot) {
+  try {
+    if (!toolInput || typeof toolInput !== "object") return cwdRoot;
+    const fp = toolInput.file_path;
+    if (typeof fp !== "string" || fp.trim() === "") return cwdRoot;
+    const p = toolPathToNative(fp.trim());
+    const abs = isAbsolute4(p) ? resolve5(p) : resolve5(cwdRoot ?? cwd, p);
+    let dir = dirname2(abs);
+    for (; ; ) {
+      if (existsSync3(join7(dir, ".git"))) break;
+      const up = dirname2(dir);
+      if (up === dir) return cwdRoot;
+      dir = up;
+    }
+    if (cwdRoot && samePath(dir, cwdRoot)) return cwdRoot;
+    return repoRoot(dir) ?? cwdRoot;
+  } catch {
+    return cwdRoot;
+  }
+}
+function samePath(a, b) {
+  const norm = (p) => {
+    let r = resolve5(p);
+    try {
+      r = realpathSync2.native(r);
+    } catch {
+    }
+    return process.platform === "win32" || process.platform === "darwin" ? r.toLowerCase() : r;
+  };
+  return norm(a) === norm(b);
 }
 function sessionStart(root, deps) {
   const idx = loadIndex(root);
@@ -1281,7 +1493,7 @@ function sessionStart(root, deps) {
     fresh = false;
   }
   if (!fresh) {
-    const spawnIt = deps.spawnIndexer ?? defaultSpawnIndexer(deps.cliPath ?? join6(scriptDir(), "cli.js"));
+    const spawnIt = deps.spawnIndexer ?? defaultSpawnIndexer(deps.cliPath ?? join7(scriptDir(), "cli.js"));
     try {
       spawnIt(root);
     } catch (err) {
@@ -1324,9 +1536,30 @@ function preToolUse(root, cfg, sessionId, input, deadline) {
       saveSession(root, session);
     } catch (err) {
       logError(root, err);
+      out = denyToContext(out);
     }
   }
   return out;
+}
+function denyToContext(out) {
+  if (!out) return out;
+  try {
+    const o = JSON.parse(out);
+    const h = o.hookSpecificOutput;
+    if (!h || h.permissionDecision !== "deny") return out;
+    const reason = typeof h.permissionDecisionReason === "string" ? h.permissionDecisionReason : "";
+    const extra = typeof h.additionalContext === "string" ? `
+
+${h.additionalContext}` : "";
+    const note = "Chesterton could not save its session state, so this edit was allowed instead of stopped. Read the note below before going on.";
+    return JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: `${note}
+
+${reason}${extra}` }
+    });
+  } catch {
+    return null;
+  }
 }
 function memoBlame(deadline, inner = blameRange) {
   const cache = /* @__PURE__ */ new Map();
@@ -1369,16 +1602,17 @@ function fallbackFindings(root, change, cfg, deadline) {
   analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn });
   const idx = { version: 1, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
   let n = 0;
+  let shallow = null;
   for (const sha of blame.shas) {
     if (n++ >= MAX_FALLBACK_COMMITS) break;
     if (cfg.ignoreCommits.some((p) => p && sha.startsWith(p))) continue;
     const meta = runGit(["show", "-s", "--format=%H%x00%aI%x00%an%x00%P%x00%s%x00%b", sha], root, deadline.budget());
     const [full = sha, date = "", author = "", parents = "", subject = "", body = ""] = meta.replace(/\n$/, "").split("\0");
+    const parentCount = parents.trim() ? parents.trim().split(/\s+/).length : 0;
+    shallow ??= shallowInfo(root);
+    if (shallow.boundary.has(full) || shallow.shallow && parentCount === 0) continue;
     const files = parseNumstat(runGit(["show", "--numstat", "--format=", "--no-color", sha], root, deadline.budget()));
-    const res = classifyCommit(
-      { sha: full, subject, body, files, parents: parents.trim() ? parents.trim().split(/\s+/).length : 0 },
-      cfg
-    );
+    const res = classifyCommit({ sha: full, subject, body, files, parents: parentCount }, cfg);
     if (!res.isFix) continue;
     const fix = { sha: full, date, author, subject, score: res.score, reasons: res.reasons, refs: res.refs, testFiles: res.testFiles };
     idx.commits[full] = fix;
@@ -1423,7 +1657,7 @@ function stop(root, cfg, sessionId, deadline) {
     }
     let workText = "";
     try {
-      workText = readFileSync7(join6(root, rel), "utf8");
+      workText = readFileSync8(join7(root, rel), "utf8");
     } catch {
       workText = "";
     }
@@ -1439,27 +1673,29 @@ function stop(root, cfg, sessionId, deadline) {
     }
   }
   if (ledger.length === 0) return null;
-  for (const f of ledger) {
-    session.findings.push({
-      at: (/* @__PURE__ */ new Date()).toISOString(),
-      key: `${f.file}@${f.fix.sha}`,
-      kind: f.kind,
-      strength: f.strength,
-      file: f.file,
-      sha: f.fix.sha,
-      decision: "stop-ledger"
-    });
-  }
-  try {
-    saveSession(root, session);
-  } catch (err) {
-    logError(root, err);
-  }
+  const commit = () => {
+    for (const f of ledger) {
+      session.findings.push({
+        at: (/* @__PURE__ */ new Date()).toISOString(),
+        key: `${f.file}@${f.fix.sha}`,
+        kind: f.kind,
+        strength: f.strength,
+        file: f.file,
+        sha: f.fix.sha,
+        decision: "stop-ledger"
+      });
+    }
+    try {
+      saveSession(root, session);
+    } catch (err) {
+      logError(root, err);
+    }
+  };
   const items = ledger.map((f) => `- ${f.file}: ${shortVerb(f)} ${f.fix.sha.slice(0, 7)} "${f.fix.subject}" (git show ${f.fix.sha.slice(0, 7)})`);
   const text = `Chesterton: before you finish, ${ledger.length === 1 ? "one change" : `${ledger.length} changes`} from this session touch past bug fixes that were not flagged at edit time:
 ${items.join("\n")}
 Check each fix still holds, and tell the user if you removed or reverted one on purpose.`;
-  return JSON.stringify({ hookSpecificOutput: { hookEventName: "Stop", additionalContext: text } });
+  return { text: JSON.stringify({ hookSpecificOutput: { hookEventName: "Stop", additionalContext: text } }), commit };
 }
 function readStdin() {
   return new Promise((res) => {
@@ -1490,9 +1726,9 @@ function isMain() {
     if (!argv1) return false;
     const self = fileURLToPath(import.meta.url);
     const norm = (p) => {
-      let r = resolve3(p);
+      let r = resolve5(p);
       try {
-        r = realpathSync(r);
+        r = realpathSync2(r);
       } catch {
       }
       return process.platform === "win32" ? r.toLowerCase() : r;

@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import { realpathSync } from "node:fs";
-import { isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
+import { readFileSync as readFileSync8, realpathSync, statSync as statSync3 } from "node:fs";
+import { isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 var GitError = class extends Error {
 };
 function runGit(args, cwd, timeoutMs = 1e4) {
@@ -47,6 +49,21 @@ function headSha(cwd, timeoutMs = 5e3) {
     return out || null;
   } catch {
     return null;
+  }
+}
+function shallowInfo(cwd, timeoutMs = 5e3) {
+  const boundary = /* @__PURE__ */ new Set();
+  try {
+    let p = runGit(["rev-parse", "--git-path", "shallow"], cwd, timeoutMs).trim();
+    if (!isAbsolute(p)) p = resolve(cwd, p);
+    if (!existsSync(p)) return { shallow: false, boundary };
+    for (const line of readFileSync(p, "utf8").split(/\r?\n/)) {
+      const sha = line.trim();
+      if (sha) boundary.add(sha);
+    }
+    return { shallow: boundary.size > 0, boundary };
+  } catch {
+    return { shallow: false, boundary };
   }
 }
 function isAncestor(cwd, ancestor, descendant, timeoutMs = 1e4) {
@@ -131,7 +148,7 @@ function toPosix(p) {
 }
 
 // src/config.ts
-import { readFileSync } from "node:fs";
+import { readFileSync as readFileSync2 } from "node:fs";
 import { join } from "node:path";
 var DEFAULT_CONFIG = {
   mode: "speedbump",
@@ -143,6 +160,8 @@ var DEFAULT_CONFIG = {
   hookTimeoutMs: 1500
 };
 var CONFIG_FILE = ".chesterton.yml";
+var MAX_HOOK_TIMEOUT_MS = 4e3;
+var MIN_HOOK_TIMEOUT_MS = 100;
 var MODES = ["speedbump", "ask", "warn-only"];
 function parseYamlSubset(text) {
   const values = {};
@@ -291,8 +310,11 @@ function parseConfig(text) {
       }
       case "hook_timeout_ms": {
         const n = asInt(value);
-        if (n !== null && n >= 100 && n <= 6e4) cfg.hookTimeoutMs = n;
-        else bad(key, "expected a whole number between 100 and 60000");
+        if (n !== null && n >= MIN_HOOK_TIMEOUT_MS && n <= MAX_HOOK_TIMEOUT_MS) cfg.hookTimeoutMs = n;
+        else if (n !== null && n > MAX_HOOK_TIMEOUT_MS) {
+          cfg.hookTimeoutMs = MAX_HOOK_TIMEOUT_MS;
+          warnings.push(`hook_timeout_ms: ${n} is more than the hook timeout allows, capped at ${MAX_HOOK_TIMEOUT_MS}`);
+        } else bad(key, `expected a whole number between ${MIN_HOOK_TIMEOUT_MS} and ${MAX_HOOK_TIMEOUT_MS}`);
         break;
       }
       case "protect": {
@@ -331,7 +353,7 @@ function parseConfig(text) {
 function loadConfigWithWarnings(repoRoot2) {
   let text;
   try {
-    text = readFileSync(join(repoRoot2, CONFIG_FILE), "utf8");
+    text = readFileSync2(join(repoRoot2, CONFIG_FILE), "utf8");
   } catch {
     return { config: { ...DEFAULT_CONFIG, protect: [], fixPatternsExtra: [], ignoreCommits: [] }, warnings: [], found: false };
   }
@@ -350,7 +372,9 @@ function loadConfig(repoRoot2) {
 }
 
 // src/index-builder.ts
-import { closeSync, openSync, statSync, unlinkSync as unlinkSync2, writeSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, openSync, readFileSync as readFileSync4, statSync, unlinkSync as unlinkSync2, utimesSync, writeSync } from "node:fs";
+import { hostname } from "node:os";
 import { join as join3 } from "node:path";
 
 // src/types.ts
@@ -544,35 +568,55 @@ ${body}` : subject;
 }
 
 // src/index-store.ts
-import { existsSync, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join as join2, resolve } from "node:path";
+import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync3, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 var INDEX_FILE = "index.json";
 var dirCache = /* @__PURE__ */ new Map();
 function indexDir(repoRoot2) {
   const cached = dirCache.get(repoRoot2);
-  if (cached && existsSync(cached)) return cached;
+  if (cached && existsSync2(cached)) return cached;
   let gitDir;
   try {
     gitDir = runGit(["rev-parse", "--absolute-git-dir"], repoRoot2, 5e3).trim();
   } catch {
     gitDir = runGit(["rev-parse", "--git-dir"], repoRoot2, 5e3).trim();
   }
-  if (!isAbsolute(gitDir)) gitDir = resolve(repoRoot2, gitDir);
+  if (!isAbsolute2(gitDir)) gitDir = resolve2(repoRoot2, gitDir);
   const dir = join2(gitDir, "chesterton");
   mkdirSync(dir, { recursive: true });
   dirCache.set(repoRoot2, dir);
   return dir;
 }
+var isObj = (x) => !!x && typeof x === "object" && !Array.isArray(x);
+var isStrArr = (x) => Array.isArray(x) && x.every((v) => typeof v === "string");
+function isValidEntries(x) {
+  if (!Array.isArray(x)) return false;
+  for (const e of x) {
+    if (!isObj(e) || typeof e.hash !== "string" || typeof e.text !== "string" || typeof e.line !== "number") return false;
+  }
+  return true;
+}
+function isValidCommit(x) {
+  return isObj(x) && typeof x.sha === "string" && typeof x.date === "string" && typeof x.author === "string" && typeof x.subject === "string" && typeof x.score === "number" && isStrArr(x.reasons) && isStrArr(x.refs) && isStrArr(x.testFiles);
+}
+function isValidRecord(x) {
+  return isObj(x) && typeof x.sha === "string" && typeof x.path === "string" && (x.oldPath === void 0 || typeof x.oldPath === "string") && isValidEntries(x.added) && isValidEntries(x.removed);
+}
 function isValidIndex(x) {
-  if (!x || typeof x !== "object") return false;
-  const o = x;
-  return o.version === INDEX_VERSION && typeof o.head === "string" && typeof o.builtAt === "string" && !!o.commits && typeof o.commits === "object" && !!o.files && typeof o.files === "object";
+  if (!isObj(x)) return false;
+  if (x.version !== INDEX_VERSION || typeof x.head !== "string" || typeof x.builtAt !== "string") return false;
+  if (!isObj(x.commits) || !isObj(x.files)) return false;
+  for (const c of Object.values(x.commits)) if (!isValidCommit(c)) return false;
+  for (const recs of Object.values(x.files)) {
+    if (!Array.isArray(recs) || !recs.every(isValidRecord)) return false;
+  }
+  return true;
 }
 function loadIndex(repoRoot2) {
   try {
     const file = join2(indexDir(repoRoot2), INDEX_FILE);
-    if (!existsSync(file)) return null;
-    const parsed = JSON.parse(readFileSync2(file, "utf8"));
+    if (!existsSync2(file)) return null;
+    const parsed = JSON.parse(readFileSync3(file, "utf8"));
     return isValidIndex(parsed) ? parsed : null;
   } catch {
     return null;
@@ -612,6 +656,7 @@ function emptyIndex(head = "") {
 // src/index-builder.ts
 var LOCK_FILE = "index.lock";
 var STALE_LOCK_MS = 5 * 6e4;
+var MAX_LIVE_LOCK_MS = 30 * 6e4;
 var DEFAULT_TIMEOUT_MS = 5 * 6e4;
 var MAX_TEXT = 200;
 function sinceArg(history) {
@@ -627,8 +672,19 @@ function sinceArg(history) {
   if (/^\d{4}-\d{2}-\d{2}/.test(h)) return `--since=${h}`;
   return null;
 }
-var META_FORMAT = "--format=%x1e%H%x1f%P%x1f%aI%x1f%an%x1f%s%x1f%b%x1f";
+function newSeparators() {
+  const token = randomBytes(8).toString("hex");
+  return { record: `${token}`, field: `${token}` };
+}
+function metaFormat(sep) {
+  const esc = (s) => s.replace(/%/g, "%%").replace(/\x1e/g, "%x1e").replace(/\x1f/g, "%x1f");
+  const r = esc(sep.record);
+  const f = esc(sep.field);
+  return `--format=${r}%H${f}%P${f}%aI${f}%an${f}%s${f}%b${f}`;
+}
+var DEFAULT_SEPARATORS = { record: "", field: "" };
 function logMeta(repoRoot2, range, cfg, timeoutMs) {
+  const sep = newSeparators();
   const args = [
     "log",
     "--no-merges",
@@ -641,25 +697,25 @@ function logMeta(repoRoot2, range, cfg, timeoutMs) {
     "--raw",
     "--numstat",
     "-z",
-    META_FORMAT
+    metaFormat(sep)
   ];
   const since = sinceArg(cfg.history);
   if (since) args.push(since);
   if (cfg.maxCommits && cfg.maxCommits > 0) args.push(`-n${Math.floor(cfg.maxCommits)}`);
   args.push(...range, "--");
-  return parseMeta(runGit(args, repoRoot2, timeoutMs));
+  return parseMeta(runGit(args, repoRoot2, timeoutMs), sep);
 }
-function parseMeta(out) {
+function parseMeta(out, sep = DEFAULT_SEPARATORS) {
   const commits = [];
-  for (const chunk of out.split("")) {
+  for (const chunk of out.split(sep.record)) {
     if (!chunk.trim()) continue;
     const parts = [];
     let pos = 0;
     for (let i = 0; i < 6; i++) {
-      const next = chunk.indexOf("", pos);
+      const next = chunk.indexOf(sep.field, pos);
       if (next < 0) break;
       parts.push(chunk.slice(pos, next));
-      pos = next + 1;
+      pos = next + sep.field.length;
     }
     if (parts.length < 6) continue;
     const [sha, parents, date, author, subject, body] = parts;
@@ -877,22 +933,37 @@ function parsePatches(out) {
   }
   return result;
 }
+var IndexLockError = class extends Error {
+};
+function ownerAlive(p) {
+  try {
+    const o = JSON.parse(readFileSync4(p, "utf8"));
+    if (typeof o.pid !== "number" || !Number.isInteger(o.pid) || o.pid <= 0) return false;
+    if (typeof o.host === "string" && o.host !== hostname()) return false;
+    if (o.pid === process.pid) return false;
+    process.kill(o.pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
 function acquireLock(dir) {
   const p = join3(dir, LOCK_FILE);
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const fd = openSync(p, "wx");
       try {
-        writeSync(fd, JSON.stringify({ pid: process.pid, at: (/* @__PURE__ */ new Date()).toISOString() }));
+        writeSync(fd, JSON.stringify({ pid: process.pid, host: hostname(), at: (/* @__PURE__ */ new Date()).toISOString() }));
       } finally {
         closeSync(fd);
       }
       return p;
     } catch (err) {
-      if (err.code !== "EEXIST") return null;
+      const code = err.code;
+      if (code !== "EEXIST") throw new IndexLockError(`cannot create ${p}: ${err.message}`);
       try {
-        const st = statSync(p);
-        if (Date.now() - st.mtimeMs > STALE_LOCK_MS) {
+        const age = Date.now() - statSync(p).mtimeMs;
+        if (age > STALE_LOCK_MS && (age > MAX_LIVE_LOCK_MS || !ownerAlive(p))) {
           unlinkSync2(p);
           continue;
         }
@@ -904,6 +975,22 @@ function acquireLock(dir) {
   }
   return null;
 }
+function touchLock(p) {
+  try {
+    const now = /* @__PURE__ */ new Date();
+    utimesSync(p, now, now);
+  } catch {
+  }
+}
+function isLockHeld(repoRoot2) {
+  try {
+    const p = join3(indexDir(repoRoot2), LOCK_FILE);
+    const age = Date.now() - statSync(p).mtimeMs;
+    return age <= STALE_LOCK_MS || age <= MAX_LIVE_LOCK_MS && ownerAlive(p);
+  } catch {
+    return false;
+  }
+}
 function releaseLock(p) {
   try {
     unlinkSync2(p);
@@ -914,28 +1001,26 @@ function trackedFiles(repoRoot2, head, timeoutMs) {
   const out = runGit(["ls-tree", "-r", "-z", "--name-only", "--full-tree", head], repoRoot2, timeoutMs);
   return new Set(out.split("\0").filter(Boolean).map(toPosix));
 }
-function buildIndex(repoRoot2, cfg, opts = {}) {
+function buildIndexDetailed(repoRoot2, cfg, opts = {}) {
   const deadline = Date.now() + (opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const remaining = () => Math.max(1e3, deadline - Date.now());
-  let dir;
-  try {
-    dir = indexDir(repoRoot2);
-  } catch {
-    return emptyIndex();
-  }
+  const dir = indexDir(repoRoot2);
   const head = headSha(repoRoot2);
-  if (!head) return emptyIndex();
+  if (!head) return { index: emptyIndex(), outcome: "no-commits" };
   const lock = acquireLock(dir);
-  if (!lock) return loadIndex(repoRoot2) ?? emptyIndex();
+  if (!lock) return { index: loadIndex(repoRoot2) ?? emptyIndex(), outcome: "busy" };
   try {
     const prev = opts.full ? null : loadIndex(repoRoot2);
-    if (prev && prev.head === head) return prev;
+    if (prev && prev.head === head) return { index: prev, outcome: "up-to-date" };
     const base = prev && prev.head && isAncestor(repoRoot2, prev.head, head, remaining()) ? prev : null;
     const range = base ? [`${base.head}..${head}`] : [head];
     const metas = logMeta(repoRoot2, range, cfg, remaining());
+    touchLock(lock);
+    const shallow = shallowInfo(repoRoot2);
     const commits = {};
     const fixShas = [];
     for (const m of metas) {
+      if (shallow.boundary.has(m.sha) || shallow.shallow && m.parents === 0) continue;
       const r = classifyCommit({ sha: m.sha, subject: m.subject, body: m.body, files: m.files, parents: m.parents }, cfg);
       if (!r.isFix) continue;
       fixShas.push(m.sha);
@@ -951,6 +1036,7 @@ function buildIndex(repoRoot2, cfg, opts = {}) {
       };
     }
     const recordsBySha = readFixPatches(repoRoot2, fixShas, remaining());
+    touchLock(lock);
     const forward = /* @__PURE__ */ new Map();
     const resolvePath = (p) => forward.has(p) ? forward.get(p) : p;
     const files = {};
@@ -979,7 +1065,7 @@ function buildIndex(repoRoot2, cfg, opts = {}) {
     for (const key of Object.keys(files)) if (!tracked.has(key)) delete files[key];
     const idx = { version: INDEX_VERSION, head, builtAt: (/* @__PURE__ */ new Date()).toISOString(), commits, files };
     saveIndex(repoRoot2, idx);
-    return idx;
+    return { index: idx, outcome: "built" };
   } finally {
     releaseLock(lock);
   }
@@ -991,11 +1077,11 @@ function isIndexFresh(repoRoot2, idx) {
 }
 
 // src/analyze.ts
-import { readFileSync as readFileSync4 } from "node:fs";
+import { readFileSync as readFileSync6 } from "node:fs";
 import { join as join5 } from "node:path";
 
 // src/blame.ts
-import { readFileSync as readFileSync3, statSync as statSync2 } from "node:fs";
+import { readFileSync as readFileSync5, statSync as statSync2 } from "node:fs";
 import { join as join4 } from "node:path";
 var HEADER_RE = /^([0-9a-f]{40}|[0-9a-f]{64}) (\d+) (\d+)(?: (\d+))?$/;
 function parsePorcelain(out) {
@@ -1026,7 +1112,7 @@ function blameRange(repoRoot2, relPath, start, end, timeoutMs = 5e3) {
     const rel = toPosix(relPath).replace(/^(\.\/)+/, "");
     const full = join4(repoRoot2, rel);
     if (!statSync2(full).isFile()) return [];
-    const lineCount = splitLines(readFileSync3(full, "utf8")).length;
+    const lineCount = splitLines(readFileSync5(full, "utf8")).length;
     const s = Math.max(1, Math.floor(start));
     const e = Math.min(lineCount, Math.floor(end));
     if (lineCount === 0 || s > e) return [];
@@ -1053,7 +1139,7 @@ function isPureMove(r) {
 }
 function readCurrent(repoRoot2, relPath) {
   try {
-    return readFileSync4(join5(repoRoot2, relPath), "utf8");
+    return readFileSync6(join5(repoRoot2, relPath), "utf8");
   } catch {
     return null;
   }
@@ -1399,7 +1485,7 @@ function parseBlamePorcelain(out, relPath) {
 }
 
 // src/why.ts
-import { readFileSync as readFileSync5 } from "node:fs";
+import { readFileSync as readFileSync7 } from "node:fs";
 import { join as join6 } from "node:path";
 var ZERO_SHA2 = /^0+$/;
 var HISTORY_LIMIT = 10;
@@ -1408,7 +1494,7 @@ function explainLine(repoRoot2, relPath, line, idx) {
   const out = [];
   let fileLines;
   try {
-    fileLines = splitLines(readFileSync5(join6(repoRoot2, path), "utf8"));
+    fileLines = splitLines(readFileSync7(join6(repoRoot2, path), "utf8"));
   } catch {
     return `${path}: file not found in the working tree.`;
   }
@@ -1513,6 +1599,8 @@ function day(iso) {
 
 // src/cli.ts
 var VERSION = "0.1.0";
+var DEFAULT_LOCK_WAIT_MS = 6e4;
+var LOCK_POLL_MS = 250;
 var HELP = `chesterton ${VERSION}
 Stops Claude from quietly undoing past bug fixes.
 
@@ -1528,7 +1616,9 @@ Usage:
   chesterton --version
   chesterton help
 
-Exit codes: 0 ok, 1 strong findings from check (or index failed), 2 usage or setup error.`;
+Exit codes: 0 ok, 1 strong findings from check, a failed index, or a why line that does not exist,
+2 usage or setup error (check also exits 2 when another index build is still running after 60 s;
+set CHESTERTON_LOCK_WAIT_MS to change the wait).`;
 var UsageError = class extends Error {
 };
 function parseArgs(argv, valueFlags) {
@@ -1621,10 +1711,11 @@ function cmdIndex(io, full, quiet) {
   const started = Date.now();
   try {
     const cfg = loadConfig(root);
-    const idx = buildIndex(root, cfg, { full });
+    const { index: idx, outcome } = buildIndexDetailed(root, cfg, { full });
     if (!quiet) {
       const secs = ((Date.now() - started) / 1e3).toFixed(1);
-      if (!idx.head) io.out("No commits yet, nothing to index.");
+      if (outcome === "busy") io.out("Another index build is running. It will save the index when it finishes.");
+      else if (outcome === "no-commits") io.out("No commits yet, nothing to index.");
       else
         io.out(
           `Indexed ${plural(Object.keys(idx.commits).length, "fix commit")} across ${plural(Object.keys(idx.files).length, "file")} at ${idx.head.slice(0, 7)} in ${secs}s.`
@@ -1655,7 +1746,7 @@ function parseFileLine(args) {
   return { file, line };
 }
 function toRepoPath(root, cwd, file) {
-  const abs = isAbsolute2(file) ? file : resolve2(cwd, file);
+  const abs = isAbsolute3(file) ? file : resolve3(cwd, file);
   let rootReal = root;
   let absReal = abs;
   try {
@@ -1667,7 +1758,7 @@ function toRepoPath(root, cwd, file) {
   } catch {
   }
   const rel = relative(rootReal, absReal);
-  if (rel.startsWith("..") || isAbsolute2(rel)) return null;
+  if (rel.startsWith("..") || isAbsolute3(rel)) return null;
   return toPosix(rel);
 }
 function cmdWhy(io, args) {
@@ -1679,8 +1770,77 @@ function cmdWhy(io, args) {
     io.err(`chesterton: ${file} is outside this repository (${root}).`);
     return 2;
   }
+  const problem = whyProblem(root, rel, line);
+  if (problem) {
+    io.err(`chesterton: ${problem}`);
+    return 1;
+  }
   io.out(explainLine(root, rel, line, loadIndex(root)));
   return 0;
+}
+function whyProblem(root, rel, line) {
+  const full = resolve3(root, rel);
+  let st;
+  try {
+    st = statSync3(full);
+  } catch {
+    return `${rel}: file not found in the working tree.`;
+  }
+  if (st.isDirectory()) return `${rel} is a directory, not a file.`;
+  let count;
+  try {
+    count = splitLines(readFileSync8(full, "utf8")).length;
+  } catch (e) {
+    return `${rel}: cannot read the file (${e.message}).`;
+  }
+  if (line > count) return `${rel}:${line}: no such line (the file has ${plural(count, "line")}).`;
+  return null;
+}
+function sleepMs(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+    }
+  }
+}
+function lockWaitMs(io) {
+  if (typeof io.lockWaitMs === "number" && io.lockWaitMs >= 0) return io.lockWaitMs;
+  const env = Number(process.env.CHESTERTON_LOCK_WAIT_MS);
+  return Number.isFinite(env) && env >= 0 ? env : DEFAULT_LOCK_WAIT_MS;
+}
+function freshIndexForCheck(io, root, cfg) {
+  let idx = loadIndex(root);
+  if (isIndexFresh(root, idx)) return idx;
+  io.err(idx ? "chesterton: index is out of date, updating it first." : "chesterton: no index yet, building it first.");
+  const waitMs = lockWaitMs(io);
+  const until = Date.now() + waitMs;
+  let said = false;
+  for (; ; ) {
+    let res;
+    try {
+      res = buildIndexDetailed(root, cfg);
+    } catch (e) {
+      io.err(`chesterton: index failed: ${e.message}`);
+      return null;
+    }
+    if (res.outcome !== "busy") return res.index;
+    idx = loadIndex(root);
+    if (isIndexFresh(root, idx)) return idx;
+    if (Date.now() >= until) break;
+    if (!said) {
+      io.err("chesterton: another index build is running, waiting for it to finish.");
+      said = true;
+    }
+    do
+      sleepMs(Math.max(0, Math.min(LOCK_POLL_MS, until - Date.now())));
+    while (Date.now() < until && isLockHeld(root));
+  }
+  io.err(
+    `chesterton: another index build is still running after ${Math.round(waitMs / 1e3)}s, so the diff was not checked. Run check again when it finishes, or set CHESTERTON_LOCK_WAIT_MS to wait longer.`
+  );
+  return null;
 }
 function cmdCheck(io, range) {
   const root = needRepo(io);
@@ -1697,16 +1857,7 @@ function cmdCheck(io, range) {
     io.out("Nothing to check.");
     return 0;
   }
-  let idx = loadIndex(root);
-  if (!isIndexFresh(root, idx)) {
-    io.err(idx ? "chesterton: index is out of date, updating it first." : "chesterton: no index yet, building it first.");
-    try {
-      idx = buildIndex(root, cfg);
-    } catch (e) {
-      io.err(`chesterton: index failed: ${e.message}`);
-      return 2;
-    }
-  }
+  const idx = freshIndexForCheck(io, root, cfg);
   if (!idx) return 2;
   const head = headSha2(root);
   const findings = [];

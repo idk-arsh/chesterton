@@ -231,10 +231,10 @@ describe("fix commit shapes", () => {
     expect(res.out.permissionDecisionReason).toContain("修复");
   });
 
-  // BUG (wrong result, low): commit metadata is split on \x1e and \x1f. A message that contains either
+  // Was a bug (wrong result, low): commit metadata is split on \x1e and \x1f. A message that contains either
   // control character (pasted from a terminal or a tool) shifts the fields, so the commit is dropped or
   // its subject, author and body land in the wrong fields.
-  it.fails("a commit message containing \\x1e or \\x1f is still parsed correctly", () => {
+  it("a commit message containing \\x1e or \\x1f is still parsed correctly", () => {
     const r = newRepo();
     const fix = withFix(r, "src/sock.ts", "fix: race on close \x1f odd \x1e chars (#412)");
     const idx = buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });

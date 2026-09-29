@@ -253,8 +253,8 @@ describe("hook input shapes (in process)", () => {
 
   // Cosmetic: two different session ids can share a session file after sanitizing,
   // so one session's acknowledgement lets the other session's first attempt through.
-  // BUG: sanitizeSessionId maps "a/b" and "a_b" (and "a:b") to the same file "a_b.json".
-  it.fails("different session ids never share acknowledgements", () => {
+  // Was a bug: sanitizeSessionId maps "a/b" and "a_b" (and "a:b") to the same file "a_b.json".
+  it("different session ids never share acknowledgements", () => {
     const r = fixRepo();
     const mk = (sid: string) =>
       JSON.stringify({

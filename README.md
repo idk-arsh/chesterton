@@ -108,7 +108,7 @@ Optional. Put a `.chesterton.yml` at the repo root. See
 | `protect` | `[]` | Globs where a strong hit always asks you, whatever the mode. For example `src/payments/**`. |
 | `fix_patterns_extra` | `[]` | Extra regexes that count as fix words in commit messages, like `SEV\d` or `postmortem`. |
 | `ignore_commits` | `[]` | Commit shas (prefixes are fine) that should never count as fixes. Use this for false positives. |
-| `hook_timeout_ms` | `1500` | Time budget for the edit check. Past it, the edit is allowed. |
+| `hook_timeout_ms` | `1500` | Time budget for the edit check, from 100 to 4000. Past it, the edit is allowed. Higher values are capped at 4000 so the check always ends inside Claude Code's 5 second hook timeout. |
 
 Bad values fall back to the default. `chesterton status` prints any warnings about the file.
 
@@ -132,6 +132,12 @@ node path/to/chesterton/dist/cli.js why src/socket.ts:3
 | `why <file>:<line>` | Who last touched a line, the commits that shaped it, and which of them were fixes, with refs and tests. |
 | `check [--staged \| --base <rev>]` | Run the same check on a git diff. With no flag it checks uncommitted changes against HEAD. `--staged` checks what you're about to commit. `--base main` checks everything since your branch left `main`. Exits 1 on a strong hit, so it works as a pre-commit hook or a CI step. |
 | `status` | Whether the index exists, when it was built, whether HEAD has moved since, and how many fixes it holds. |
+
+Exit codes: 0 when all is well, 1 for a strong hit from `check`, a failed `index`, or a `why` on a
+missing file, a directory, or a line past the end of the file, and 2 for usage or setup errors. If
+another index build is running, `check` waits up to 60 seconds for it (set `CHESTERTON_LOCK_WAIT_MS`
+to change that) and exits 2 if it is still going, so a pre-commit hook never passes a change it did
+not really check.
 
 A pre-commit hook is one line:
 

@@ -2,17 +2,17 @@
 // Fails open: any error, timeout, or missing piece means exit 0 with no output.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BlameLine, ChestertonConfig, ChestertonIndex, EditChange, Finding, FixCommit, LineEntry } from "./types.js";
 import { hashLine, isTrivial, normalizeLine, splitLines } from "./normalize.js";
-import { repoRoot as findRepoRoot, runGit } from "./git.js";
+import { repoRoot as findRepoRoot, runGit, shallowInfo } from "./git.js";
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
 import { indexDir, loadIndex } from "./index-store.js";
 import { isIndexFresh } from "./index-builder.js";
 import { blameRange, parsePorcelain } from "./blame.js";
 import { classifyCommit, type CommitFileChange } from "./classify.js";
-import { changeFromToolCall, diffLines } from "./edit-diff.js";
+import { changeFromToolCall, diffLines, toolPathToNative } from "./edit-diff.js";
 import { analyzeChange, type BlameFn } from "./analyze.js";
 import { decidePreToolUse } from "./decide.js";
 import { loadSession, saveSession, type SessionState } from "./session.js";
@@ -93,10 +93,13 @@ export function handleHookInput(raw: string, deps: HookDeps = {}): string | null
     if (!input || typeof input !== "object") return null;
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
     root = findRepoRoot(cwd);
+    const event = input.hook_event_name;
+    // An edited file can live in a different repo than the session (a submodule, a nested repo):
+    // check it against the repo that actually owns it.
+    if (event === "PreToolUse") root = rootForToolInput(input.tool_input, cwd, root);
     if (!root) return null;
     const cfg = loadConfig(root);
     const sessionId = typeof input.session_id === "string" && input.session_id ? input.session_id : "default";
-    const event = input.hook_event_name;
 
     if (event === "PreToolUse") {
       const deadline = new Deadline(startedAt + cfg.hookTimeoutMs);
@@ -108,14 +111,54 @@ export function handleHookInput(raw: string, deps: HookDeps = {}): string | null
     if (event === "Stop") {
       if (input.stop_hook_active === true) return null;
       const deadline = new Deadline(startedAt + Math.max(cfg.hookTimeoutMs * 3, 3000));
-      const out = stop(root, cfg, sessionId, deadline);
-      return deadline.remaining() > 0 ? out : null;
+      const res = stop(root, cfg, sessionId, deadline);
+      if (!res || deadline.remaining() <= 0) return null;
+      // Only record the ledger as surfaced once we know it is going out.
+      res.commit();
+      return res.text;
     }
     return null;
   } catch (err) {
     logError(root, err);
     return null;
   }
+}
+
+/** Top level of the repo that owns the edited file, falling back to the session's repo. */
+function rootForToolInput(toolInput: unknown, cwd: string, cwdRoot: string | null): string | null {
+  try {
+    if (!toolInput || typeof toolInput !== "object") return cwdRoot;
+    const fp = (toolInput as Record<string, unknown>).file_path;
+    if (typeof fp !== "string" || fp.trim() === "") return cwdRoot;
+    const p = toolPathToNative(fp.trim());
+    const abs = isAbsolute(p) ? resolve(p) : resolve(cwdRoot ?? cwd, p);
+    // Walk up to the nearest directory holding a .git entry (a dir for a repo, a file for a
+    // submodule or worktree). Plain stats, so the common case costs no extra git call.
+    let dir = dirname(abs);
+    for (;;) {
+      if (existsSync(join(dir, ".git"))) break;
+      const up = dirname(dir);
+      if (up === dir) return cwdRoot;
+      dir = up;
+    }
+    if (cwdRoot && samePath(dir, cwdRoot)) return cwdRoot;
+    return findRepoRoot(dir) ?? cwdRoot;
+  } catch {
+    return cwdRoot;
+  }
+}
+
+function samePath(a: string, b: string): boolean {
+  const norm = (p: string) => {
+    let r = resolve(p);
+    try {
+      r = realpathSync.native(r);
+    } catch {
+      // keep resolved path
+    }
+    return process.platform === "win32" || process.platform === "darwin" ? r.toLowerCase() : r;
+  };
+  return norm(a) === norm(b);
 }
 
 // ---------- SessionStart ----------
@@ -186,9 +229,30 @@ function preToolUse(
       saveSession(root, session);
     } catch (err) {
       logError(root, err);
+      // The acknowledgement is lost, so a deny would repeat on every retry and Claude would be
+      // stuck. Fail open: allow, and pass the same explanation along as context.
+      out = denyToContext(out);
     }
   }
   return out;
+}
+
+function denyToContext(out: string | null): string | null {
+  if (!out) return out;
+  try {
+    const o = JSON.parse(out) as { hookSpecificOutput?: Record<string, unknown> };
+    const h = o.hookSpecificOutput;
+    if (!h || h.permissionDecision !== "deny") return out;
+    const reason = typeof h.permissionDecisionReason === "string" ? h.permissionDecisionReason : "";
+    const extra = typeof h.additionalContext === "string" ? `\n\n${h.additionalContext}` : "";
+    const note =
+      "Chesterton could not save its session state, so this edit was allowed instead of stopped. Read the note below before going on.";
+    return JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: `${note}\n\n${reason}${extra}` },
+    });
+  } catch {
+    return null;
+  }
 }
 
 /** Blame wrapper that remembers results per range, so a second analysis pass costs nothing. */
@@ -242,16 +306,18 @@ function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfi
 
   const idx: ChestertonIndex = { version: 1, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
   let n = 0;
+  let shallow: { shallow: boolean; boundary: Set<string> } | null = null;
   for (const sha of blame.shas) {
     if (n++ >= MAX_FALLBACK_COMMITS) break;
     if (cfg.ignoreCommits.some((p) => p && sha.startsWith(p))) continue;
     const meta = runGit(["show", "-s", "--format=%H%x00%aI%x00%an%x00%P%x00%s%x00%b", sha], root, deadline.budget());
     const [full = sha, date = "", author = "", parents = "", subject = "", body = ""] = meta.replace(/\n$/, "").split("\u0000");
+    const parentCount = parents.trim() ? parents.trim().split(/\s+/).length : 0;
+    // A shallow clone's boundary commit looks like it added every line; never treat it as a fix.
+    shallow ??= shallowInfo(root);
+    if (shallow.boundary.has(full) || (shallow.shallow && parentCount === 0)) continue;
     const files = parseNumstat(runGit(["show", "--numstat", "--format=", "--no-color", sha], root, deadline.budget()));
-    const res = classifyCommit(
-      { sha: full, subject, body, files, parents: parents.trim() ? parents.trim().split(/\s+/).length : 0 },
-      cfg,
-    );
+    const res = classifyCommit({ sha: full, subject, body, files, parents: parentCount }, cfg);
     if (!res.isFix) continue;
     const fix: FixCommit = { sha: full, date, author, subject, score: res.score, reasons: res.reasons, refs: res.refs, testFiles: res.testFiles };
     idx.commits[full] = fix;
@@ -285,7 +351,12 @@ function shortVerb(f: Finding): string {
   return f.kind === "removes-fix" ? "removes code added by fix" : "adds back code removed by fix";
 }
 
-function stop(root: string, cfg: ChestertonConfig, sessionId: string, deadline: Deadline): string | null {
+function stop(
+  root: string,
+  cfg: ChestertonConfig,
+  sessionId: string,
+  deadline: Deadline,
+): { text: string; commit: () => void } | null {
   const session: SessionState = loadSession(root, sessionId);
   if (session.files.length === 0) return null;
   const idx = loadIndex(root);
@@ -320,28 +391,30 @@ function stop(root: string, cfg: ChestertonConfig, sessionId: string, deadline: 
     }
   }
   if (ledger.length === 0) return null;
-  for (const f of ledger) {
-    session.findings.push({
-      at: new Date().toISOString(),
-      key: `${f.file}@${f.fix.sha}`,
-      kind: f.kind,
-      strength: f.strength,
-      file: f.file,
-      sha: f.fix.sha,
-      decision: "stop-ledger",
-    });
-  }
-  try {
-    saveSession(root, session);
-  } catch (err) {
-    logError(root, err);
-  }
+  const commit = () => {
+    for (const f of ledger) {
+      session.findings.push({
+        at: new Date().toISOString(),
+        key: `${f.file}@${f.fix.sha}`,
+        kind: f.kind,
+        strength: f.strength,
+        file: f.file,
+        sha: f.fix.sha,
+        decision: "stop-ledger",
+      });
+    }
+    try {
+      saveSession(root, session);
+    } catch (err) {
+      logError(root, err);
+    }
+  };
   const items = ledger.map((f) => `- ${f.file}: ${shortVerb(f)} ${f.fix.sha.slice(0, 7)} "${f.fix.subject}" (git show ${f.fix.sha.slice(0, 7)})`);
   const text =
     `Chesterton: before you finish, ${ledger.length === 1 ? "one change" : `${ledger.length} changes`} from this session touch past bug fixes that were not flagged at edit time:\n` +
     `${items.join("\n")}\n` +
     `Check each fix still holds, and tell the user if you removed or reverted one on purpose.`;
-  return JSON.stringify({ hookSpecificOutput: { hookEventName: "Stop", additionalContext: text } });
+  return { text: JSON.stringify({ hookSpecificOutput: { hookEventName: "Stop", additionalContext: text } }), commit };
 }
 
 // ---------- process entry ----------

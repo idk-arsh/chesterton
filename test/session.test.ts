@@ -44,7 +44,9 @@ describe("session", () => {
 
   it("sanitizes session ids for filenames", () => {
     expect(sanitizeSessionId("../../etc/passwd")).not.toContain("/");
-    expect(sanitizeSessionId("a:b*c?")).toBe("a_b_c_");
+    expect(sanitizeSessionId("a:b*c?")).toMatch(/^a_b_c_\.h[0-9a-f]{12}$/);
+    expect(sanitizeSessionId("abc-123")).toBe("abc-123");
+    expect(sanitizeSessionId("a/b")).not.toBe(sanitizeSessionId("a_b"));
     expect(sanitizeSessionId("")).toBe("default");
     expect(sanitizeSessionId("..")).not.toBe("..");
   });

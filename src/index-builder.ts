@@ -1,10 +1,12 @@
-import { closeSync, openSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, openSync, readFileSync, statSync, unlinkSync, utimesSync, writeSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import type { ChestertonConfig, ChestertonIndex, FileFixRecord, FixCommit, LineEntry } from "./types.js";
 import { INDEX_VERSION } from "./types.js";
 import { classifyCommit, isLockfile, type CommitFileChange } from "./classify.js";
 import { emptyIndex, indexDir, loadIndex, saveIndex } from "./index-store.js";
-import { headSha, isAncestor, runGit, runGitWithInput } from "./git.js";
+import { headSha, isAncestor, runGit, runGitWithInput, shallowInfo } from "./git.js";
 import { hashLine, isTrivial, normalizeLine, toPosix } from "./normalize.js";
 
 export interface BuildOptions {
@@ -12,8 +14,10 @@ export interface BuildOptions {
   timeoutMs?: number;
 }
 
-const LOCK_FILE = "index.lock";
+export const LOCK_FILE = "index.lock";
 const STALE_LOCK_MS = 5 * 60_000;
+/** A lock whose owner is still alive is honored this long, however old its mtime. */
+const MAX_LIVE_LOCK_MS = 30 * 60_000;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 const MAX_TEXT = 200;
 
@@ -47,9 +51,31 @@ export function sinceArg(history: string | undefined): string | null {
 // Metadata pass: one `git log` for every non-merge commit in range, with status + numstat.
 // ---------------------------------------------------------------------------------------------
 
-const META_FORMAT = "--format=%x1e%H%x1f%P%x1f%aI%x1f%an%x1f%s%x1f%b%x1f";
+/**
+ * Record and field separators for the metadata pass. A commit message can contain any control
+ * character, so each run adds a random token that no message will contain.
+ */
+export interface MetaSeparators {
+  record: string;
+  field: string;
+}
+
+export function newSeparators(): MetaSeparators {
+  const token = randomBytes(8).toString("hex");
+  return { record: `\x1e${token}\x1e`, field: `\x1f${token}\x1f` };
+}
+
+function metaFormat(sep: MetaSeparators): string {
+  const esc = (s: string) => s.replace(/%/g, "%%").replace(/\x1e/g, "%x1e").replace(/\x1f/g, "%x1f");
+  const r = esc(sep.record);
+  const f = esc(sep.field);
+  return `--format=${r}%H${f}%P${f}%aI${f}%an${f}%s${f}%b${f}`;
+}
+
+const DEFAULT_SEPARATORS: MetaSeparators = { record: "\x1e", field: "\x1f" };
 
 function logMeta(repoRoot: string, range: string[], cfg: ChestertonConfig, timeoutMs: number): CommitMeta[] {
+  const sep = newSeparators();
   const args = [
     "log",
     "--no-merges",
@@ -62,26 +88,26 @@ function logMeta(repoRoot: string, range: string[], cfg: ChestertonConfig, timeo
     "--raw",
     "--numstat",
     "-z",
-    META_FORMAT,
+    metaFormat(sep),
   ];
   const since = sinceArg(cfg.history);
   if (since) args.push(since);
   if (cfg.maxCommits && cfg.maxCommits > 0) args.push(`-n${Math.floor(cfg.maxCommits)}`);
   args.push(...range, "--");
-  return parseMeta(runGit(args, repoRoot, timeoutMs));
+  return parseMeta(runGit(args, repoRoot, timeoutMs), sep);
 }
 
-export function parseMeta(out: string): CommitMeta[] {
+export function parseMeta(out: string, sep: MetaSeparators = DEFAULT_SEPARATORS): CommitMeta[] {
   const commits: CommitMeta[] = [];
-  for (const chunk of out.split("\x1e")) {
+  for (const chunk of out.split(sep.record)) {
     if (!chunk.trim()) continue;
     const parts: string[] = [];
     let pos = 0;
     for (let i = 0; i < 6; i++) {
-      const next = chunk.indexOf("\x1f", pos);
+      const next = chunk.indexOf(sep.field, pos);
       if (next < 0) break;
       parts.push(chunk.slice(pos, next));
-      pos = next + 1;
+      pos = next + sep.field.length;
     }
     if (parts.length < 6) continue;
     const [sha, parents, date, author, subject, body] = parts as [string, string, string, string, string, string];
@@ -326,22 +352,46 @@ export function parsePatches(out: string): Map<string, FileFixRecord[]> {
 // Lock
 // ---------------------------------------------------------------------------------------------
 
+export class IndexLockError extends Error {}
+
+/** True when the lock names a live process on this machine. False when unknown. */
+function ownerAlive(p: string): boolean {
+  try {
+    const o = JSON.parse(readFileSync(p, "utf8")) as { pid?: unknown; host?: unknown };
+    if (typeof o.pid !== "number" || !Number.isInteger(o.pid) || o.pid <= 0) return false;
+    if (typeof o.host === "string" && o.host !== hostname()) return false;
+    if (o.pid === process.pid) return false;
+    process.kill(o.pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but belongs to someone else.
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+/**
+ * Take the build lock. Returns the lock path, or null when another build holds it.
+ * Throws IndexLockError when the lock cannot be created for any other reason (read-only dir...).
+ * A lock is stale once its mtime is over 5 minutes old, unless its owner is still running (a long
+ * full build refreshes the mtime as it goes, and a live owner is trusted for up to 30 minutes).
+ */
 function acquireLock(dir: string): string | null {
   const p = join(dir, LOCK_FILE);
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const fd = openSync(p, "wx");
       try {
-        writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+        writeSync(fd, JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString() }));
       } finally {
         closeSync(fd);
       }
       return p;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return null;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw new IndexLockError(`cannot create ${p}: ${(err as Error).message}`);
       try {
-        const st = statSync(p);
-        if (Date.now() - st.mtimeMs > STALE_LOCK_MS) {
+        const age = Date.now() - statSync(p).mtimeMs;
+        if (age > STALE_LOCK_MS && (age > MAX_LIVE_LOCK_MS || !ownerAlive(p))) {
           unlinkSync(p);
           continue;
         }
@@ -352,6 +402,27 @@ function acquireLock(dir: string): string | null {
     }
   }
   return null;
+}
+
+/** Keep a held lock fresh during a long build so nobody takes it over. */
+function touchLock(p: string): void {
+  try {
+    const now = new Date();
+    utimesSync(p, now, now);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** True when another process holds a lock that acquireLock would honor. */
+export function isLockHeld(repoRoot: string): boolean {
+  try {
+    const p = join(indexDir(repoRoot), LOCK_FILE);
+    const age = Date.now() - statSync(p).mtimeMs;
+    return age <= STALE_LOCK_MS || (age <= MAX_LIVE_LOCK_MS && ownerAlive(p));
+  } catch {
+    return false;
+  }
 }
 
 function releaseLock(p: string): void {
@@ -371,39 +442,60 @@ function trackedFiles(repoRoot: string, head: string, timeoutMs: number): Set<st
   return new Set(out.split("\0").filter(Boolean).map(toPosix));
 }
 
+/** What a build did. */
+export type BuildOutcome =
+  /** Built and saved a new index. */
+  | "built"
+  /** The saved index was already at HEAD. */
+  | "up-to-date"
+  /** Another build holds the lock; the saved index (or an empty one) came back instead. */
+  | "busy"
+  /** The repo has no commits. */
+  | "no-commits";
+
 /**
  * Build (or incrementally update) the fix index and save it.
  * Incremental when a saved index exists and its head is an ancestor of HEAD; otherwise full.
  * Returns an empty index for a repo with no commits. When another build holds the lock,
  * returns the saved index (or an empty one) without waiting.
+ * Throws when <git-dir>/chesterton cannot be created or written.
  */
 export function buildIndex(repoRoot: string, cfg: ChestertonConfig, opts: BuildOptions = {}): ChestertonIndex {
+  return buildIndexDetailed(repoRoot, cfg, opts).index;
+}
+
+/** buildIndex, plus what happened, so callers can tell "busy" from "nothing to index". */
+export function buildIndexDetailed(
+  repoRoot: string,
+  cfg: ChestertonConfig,
+  opts: BuildOptions = {},
+): { index: ChestertonIndex; outcome: BuildOutcome } {
   const deadline = Date.now() + (opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const remaining = () => Math.max(1_000, deadline - Date.now());
 
-  let dir: string;
-  try {
-    dir = indexDir(repoRoot);
-  } catch {
-    return emptyIndex();
-  }
+  const dir = indexDir(repoRoot);
   const head = headSha(repoRoot);
-  if (!head) return emptyIndex();
+  if (!head) return { index: emptyIndex(), outcome: "no-commits" };
 
   const lock = acquireLock(dir);
-  if (!lock) return loadIndex(repoRoot) ?? emptyIndex();
+  if (!lock) return { index: loadIndex(repoRoot) ?? emptyIndex(), outcome: "busy" };
 
   try {
     const prev = opts.full ? null : loadIndex(repoRoot);
-    if (prev && prev.head === head) return prev;
+    if (prev && prev.head === head) return { index: prev, outcome: "up-to-date" };
     const base = prev && prev.head && isAncestor(repoRoot, prev.head, head, remaining()) ? prev : null;
 
     const range = base ? [`${base.head}..${head}`] : [head];
     const metas = logMeta(repoRoot, range, cfg, remaining());
+    touchLock(lock);
 
+    // A shallow clone's boundary commits have no parents in the visible history, so their diff
+    // claims every line of every file. They can never be fix candidates.
+    const shallow = shallowInfo(repoRoot);
     const commits: Record<string, FixCommit> = {};
     const fixShas: string[] = [];
     for (const m of metas) {
+      if (shallow.boundary.has(m.sha) || (shallow.shallow && m.parents === 0)) continue;
       const r = classifyCommit({ sha: m.sha, subject: m.subject, body: m.body, files: m.files, parents: m.parents }, cfg);
       if (!r.isFix) continue;
       fixShas.push(m.sha);
@@ -419,6 +511,7 @@ export function buildIndex(repoRoot: string, cfg: ChestertonConfig, opts: BuildO
       };
     }
     const recordsBySha = readFixPatches(repoRoot, fixShas, remaining());
+    touchLock(lock);
 
     // Walk newest to oldest. `forward` maps a path as it existed at the commit being visited to the
     // path it has at HEAD (null when the file was deleted later). Each commit only sees renames and
@@ -456,7 +549,7 @@ export function buildIndex(repoRoot: string, cfg: ChestertonConfig, opts: BuildO
 
     const idx: ChestertonIndex = { version: INDEX_VERSION, head, builtAt: new Date().toISOString(), commits, files };
     saveIndex(repoRoot, idx);
-    return idx;
+    return { index: idx, outcome: "built" };
   } finally {
     releaseLock(lock);
   }

@@ -1,5 +1,5 @@
-import { readFileSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { EditChange } from "./types.js";
 import { splitLines, toPosix } from "./normalize.js";
 
@@ -110,21 +110,94 @@ function myers(a: string[], b: string[], maxD: number): Op[] | null {
   return ops.reverse();
 }
 
+/** Git Bash style /c/... paths become C:/... on Windows. Everything else is returned as is. */
+export function toolPathToNative(p: string): string {
+  if (process.platform === "win32") {
+    const m = /^\/([a-zA-Z])(\/.*)?$/.exec(p);
+    if (m) return `${m[1]}:${m[2] ?? "/"}`;
+  }
+  return p;
+}
+
+function realOr(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Resolve links (junctions, symlinked dirs, /tmp on macOS) in every directory of `abs`. The final
+ * component is resolved too unless it is itself a symlink, so a link file keeps its own name.
+ * For a path that does not exist yet, the nearest existing parent is resolved.
+ */
+function realPathOf(abs: string): string {
+  try {
+    if (!lstatSync(abs).isSymbolicLink()) return realpathSync.native(abs);
+    return join(realOr(dirname(abs)), basename(abs));
+  } catch {
+    // Missing: resolve the nearest parent that exists and keep the rest.
+  }
+  const rest: string[] = [];
+  let cur = abs;
+  for (;;) {
+    const up = dirname(cur);
+    rest.unshift(basename(cur));
+    if (up === cur) return abs;
+    cur = up;
+    try {
+      return join(realpathSync.native(cur), ...rest);
+    } catch {
+      // keep walking up
+    }
+  }
+}
+
+/**
+ * On case-insensitive file systems a path can name an existing file with the wrong letter case.
+ * Map each segment to the name on disk so the path matches what git tracks. Windows gets this from
+ * realpathSync.native already; macOS realpath does not always fix case.
+ */
+function trueCase(rootReal: string, rel: string): string {
+  if (process.platform !== "darwin") return rel;
+  const parts = rel.split(/[\\/]/);
+  let dir = rootReal;
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]!;
+    let name = part;
+    try {
+      const names = readdirSync(dir);
+      if (!names.includes(part)) {
+        const lower = part.toLowerCase();
+        const hit = names.find((n) => n.toLowerCase() === lower);
+        if (hit) name = hit;
+        else return [...out, ...parts.slice(i)].join("/");
+      }
+    } catch {
+      return [...out, ...parts.slice(i)].join("/");
+    }
+    out.push(name);
+    dir = join(dir, name);
+  }
+  return out.join("/");
+}
+
 /**
  * Resolve a tool's file_path to a repo-relative posix path, or null when it is outside the repo.
  * Accepts absolute Windows paths (either slash), Git Bash style /c/... paths on Windows,
- * and paths relative to the repo root.
+ * and paths relative to the repo root. Links are resolved on both sides, since git reports the
+ * repo root with links resolved while the tool path uses whatever path the session was opened with.
  */
 export function resolveRepoPath(repoRoot: string, filePath: string): { abs: string; rel: string } | null {
   if (typeof filePath !== "string" || filePath.trim() === "") return null;
-  let p = filePath.trim();
-  if (process.platform === "win32") {
-    const m = /^\/([a-zA-Z])(\/.*)?$/.exec(p);
-    if (m) p = `${m[1]}:${m[2] ?? "/"}`;
-  }
-  const abs = isAbsolute(p) ? resolve(p) : resolve(repoRoot, p);
-  const rel = relative(resolve(repoRoot), abs);
+  const p = toolPathToNative(filePath.trim());
+  const rootReal = realOr(resolve(repoRoot));
+  const abs = realPathOf(isAbsolute(p) ? resolve(p) : resolve(repoRoot, p));
+  let rel = relative(rootReal, abs);
   if (rel === "" || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute(rel)) return null;
+  rel = trueCase(rootReal, rel);
   const posix = toPosix(rel);
   if (posix === ".git" || posix.startsWith(".git/")) return null;
   return { abs, rel: posix };
@@ -181,7 +254,48 @@ export function applyEdit(content: string, e: EditSpec): string | null {
     if (e.replace_all) return content.split(oldS).join(newS);
     return content.slice(0, idx) + newS + content.slice(idx + oldS.length);
   }
-  return null;
+  return applyEolInsensitive(content, e);
+}
+
+/**
+ * Last resort for files with mixed line endings: match with CRLF folded to LF on both sides, then
+ * map the match back to offsets in the original content.
+ */
+function applyEolInsensitive(content: string, e: EditSpec): string | null {
+  const oldN = e.old_string.replace(/\r\n/g, "\n");
+  if (oldN === "") return null;
+  // norm[i] came from content[map[i]] (a CRLF pair maps to its "\r"); map[norm.length] is content.length.
+  const map: number[] = [];
+  let norm = "";
+  for (let i = 0; i < content.length; i++) {
+    map.push(i);
+    if (content[i] === "\r" && content[i + 1] === "\n") {
+      norm += "\n";
+      i++;
+    } else {
+      norm += content[i];
+    }
+  }
+  map.push(content.length);
+  const starts: number[] = [];
+  let from = 0;
+  for (;;) {
+    const at = norm.indexOf(oldN, from);
+    if (at < 0) break;
+    starts.push(at);
+    if (!e.replace_all) break;
+    from = at + oldN.length;
+  }
+  if (starts.length === 0) return null;
+  let out = "";
+  let last = 0;
+  for (const s of starts) {
+    const start = map[s]!;
+    const end = map[s + oldN.length]!;
+    out += content.slice(last, start) + e.new_string;
+    last = end;
+  }
+  return out + content.slice(last);
 }
 
 /**

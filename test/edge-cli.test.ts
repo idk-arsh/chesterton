@@ -162,16 +162,17 @@ describe("why", () => {
     expect(res.out).toContain("Not tracked by git yet");
   });
 
-  it("out of range line: explains the file length", () => {
+  it("out of range line: explains the file length on stderr", () => {
     const r = fixRepo();
     const res = run(["why", "src/socket.ts:999"], r.dir);
-    expect(res.out).toContain("no such line");
+    expect(res.err).toContain("no such line");
+    expect(res.out).toBe("");
   });
 
-  // BUG (cosmetic): `why` on a line past the end of the file, on a missing file, or on a directory
+  // Was a bug (cosmetic): `why` on a line past the end of the file, on a missing file, or on a directory
   // prints an error-ish message to stdout and exits 0. Help says usage or setup errors exit 2, so a
   // script cannot tell "here is the history" from "that line does not exist".
-  it.fails("out of range line, missing file and directory exit non-zero", () => {
+  it("out of range line, missing file and directory exit non-zero", () => {
     const r = fixRepo();
     expect(run(["why", "src/socket.ts:999"], r.dir).code).not.toBe(0);
     expect(run(["why", "src/missing.ts:1"], r.dir).code).not.toBe(0);
