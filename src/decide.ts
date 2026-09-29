@@ -87,52 +87,89 @@ function whyLine(fix: FixCommit): string {
   return parts.length > 0 ? `Why it looks like a fix: ${parts.join("; ")}` : "";
 }
 
-function linesBlock(f: Finding): string {
-  if (f.lines.length === 0) return "";
-  return `Lines:\n${f.lines.map((l) => `  ${l}`).join("\n")}`;
+/**
+ * Findings about one fix commit, merged. One edit can both remove what a fix added and put back
+ * what it removed; that is still one fix, shown once.
+ */
+interface FixGroup {
+  fix: FixCommit;
+  strong: boolean;
+  removes: string[];
+  readds: string[];
 }
 
-function findingBlock(f: Finding): string {
-  return [fixHeader(f.fix), whyLine(f.fix), linesBlock(f)].filter(Boolean).join("\n");
+/** One group per fix commit, in the order the findings came (analyze puts strong ones first). */
+function groupByFix(findings: Finding[]): FixGroup[] {
+  const groups = new Map<string, FixGroup>();
+  for (const f of findings) {
+    let g = groups.get(f.fix.sha);
+    if (!g) {
+      g = { fix: f.fix, strong: false, removes: [], readds: [] };
+      groups.set(f.fix.sha, g);
+    }
+    if (f.strength === "strong") g.strong = true;
+    const into = f.kind === "removes-fix" ? g.removes : g.readds;
+    for (const l of f.lines) if (!into.includes(l)) into.push(l);
+  }
+  return [...groups.values()];
 }
 
-function verb(f: Finding): string {
-  return f.kind === "removes-fix"
-    ? `removes code that fix ${short(f.fix.sha)} added`
-    : `adds back code that fix ${short(f.fix.sha)} removed`;
+function indented(lines: string[]): string {
+  return lines.map((l) => `  ${l}`).join("\n");
+}
+
+function linesBlock(g: FixGroup): string {
+  if (g.removes.length > 0 && g.readds.length > 0) {
+    return `Lines it removes:\n${indented(g.removes)}\nLines it adds back:\n${indented(g.readds)}`;
+  }
+  const lines = [...g.removes, ...g.readds];
+  return lines.length > 0 ? `Lines:\n${indented(lines)}` : "";
+}
+
+function groupBlock(g: FixGroup): string {
+  return [fixHeader(g.fix), whyLine(g.fix), linesBlock(g)].filter(Boolean).join("\n");
+}
+
+function verb(g: FixGroup): string {
+  const sha = short(g.fix.sha);
+  const removes = g.removes.length > 0;
+  const readds = g.readds.length > 0;
+  if (removes && readds) return `removes code that fix ${sha} added and adds back code it removed`;
+  return readds ? `adds back code that fix ${sha} removed` : `removes code that fix ${sha} added`;
+}
+
+function headline(groups: FixGroup[], relPath: string, withList: boolean): string {
+  if (groups.length === 1) return `Chesterton: this edit to ${relPath} ${verb(groups[0]!)}.`;
+  const list = withList ? ` (${groups.map(verb).join("; ")})` : "";
+  return `Chesterton: this edit to ${relPath} touches ${groups.length} past bug fixes${list}.`;
 }
 
 function denyReason(strong: Finding[], relPath: string): string {
-  const head =
-    strong.length === 1
-      ? `Chesterton: this edit to ${relPath} ${verb(strong[0]!)}.`
-      : `Chesterton: this edit to ${relPath} touches ${strong.length} past bug fixes (${strong.map(verb).join("; ")}).`;
-  const blocks = strong.map(findingBlock).join("\n\n");
-  const shas = [...new Set(strong.map((f) => short(f.fix.sha)))];
-  const show = shas.map((s) => `git show ${s}`).join(", ");
-  const anyReadd = strong.some((f) => f.kind === "re-adds-removed");
-  const anyRemove = strong.some((f) => f.kind === "removes-fix");
+  const groups = groupByFix(strong);
+  const blocks = groups.map(groupBlock).join("\n\n");
+  const show = groups.map((g) => `git show ${short(g.fix.sha)}`).join(", ");
+  const anyReadd = groups.some((g) => g.readds.length > 0);
+  const anyRemove = groups.some((g) => g.removes.length > 0);
   const what = anyRemove && anyReadd ? "changing this" : anyRemove ? "removing this" : "adding this back";
   const tail =
-    `Before ${what}, check the fix commit (${show}). Keep the fix, or rework the change around it. ` +
+    `Before ${what}, check the fix commit${groups.length === 1 ? "" : "s"} (${show}). Keep the fix, or rework the change around it. ` +
     `If you are sure it is safe, tell the user why, then retry the same edit and Chesterton will let it through.`;
-  return `${head}\n\n${blocks}\n\n${tail}`;
+  return `${headline(groups, relPath, true)}\n\n${blocks}\n\n${tail}`;
 }
 
 function askReason(strong: Finding[], relPath: string, prot: boolean): string {
-  const head =
-    strong.length === 1
-      ? `Chesterton: this edit to ${relPath} ${verb(strong[0]!)}.`
-      : `Chesterton: this edit to ${relPath} touches ${strong.length} past bug fixes.`;
+  const groups = groupByFix(strong);
   const why = prot ? `${relPath} is a protected path, so a person has to approve this.` : `Chesterton is set to ask before edits like this.`;
-  return `${head} ${why}\n\n${strong.map(findingBlock).join("\n\n")}`;
+  return `${headline(groups, relPath, false)} ${why}\n\n${groups.map(groupBlock).join("\n\n")}`;
 }
 
 function contextText(findings: Finding[], relPath: string, note?: string): string {
   const intro =
     note ??
     `Chesterton: heads up, this edit to ${relPath} may touch code from a past bug fix. It was allowed; check it still holds.`;
-  const items = findings.map((f) => `- ${f.strength === "strong" ? "" : "possibly "}${verb(f)}\n  ${findingBlock(f).replace(/\n/g, "\n  ")}`);
+  const items = groupByFix(findings).map(
+    (g) => `- ${g.strong ? "" : "possibly "}${verb(g)}\n  ${groupBlock(g).replace(/\n/g, "\n  ")}`,
+  );
   return `${intro}\n${items.join("\n")}`;
 }
 

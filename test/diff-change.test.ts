@@ -204,6 +204,6 @@ describe("blameAt", () => {
       [1, "A", "s"],
       [2, "A", "s"],
     ]);
-    expect(lines[0]?.date).toBe("2023-11-14T22:13:20.000Z");
+    expect(lines[0]?.date).toBe("2023-11-14T22:13:20+00:00");
   });
 });

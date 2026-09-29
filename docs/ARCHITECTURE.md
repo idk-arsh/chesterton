@@ -10,7 +10,12 @@ Index what every fix commit added and removed. On each edit, flag it when the ed
 
 ## Ground rules
 
-- Node 18+, TypeScript, **zero runtime dependencies**. Only `node:` builtins. Bundled by esbuild into `dist/`.
+- Node 18+, TypeScript, **zero runtime dependencies**. Only `node:` builtins. Bundled by esbuild into `dist/hook-main.js` and
+  `dist/cli-main.js`. `dist/hook.js` and `dist/cli.js` are small launchers written by `scripts/build.mjs`: they turn on Node's
+  compile cache when it exists (22.1+) and load the bundle. The hook launcher exits 0 silently if the bundle fails to load.
+- The edit hook is on the hot path of every edit. A no-finding edit should start no git process: the repo and its git dir are
+  found by walking up to `.git` in JS (`locateRepo` in `src/git.ts`, which hands unusual layouts to git), the index is read one
+  shard at a time, and blame only runs when a strong hit is possible.
 - The hook must **fail open**: any error, timeout, missing git, not-a-repo, missing index means exit 0 with no output. Never block the user because Chesterton broke.
 - No network, no model calls, no telemetry. Everything stays in `<git-dir>/chesterton/`.
 - Windows, macOS, Linux. Watch CRLF, backslash paths, spaces in paths. Always repo-relative forward-slash paths internally (`toPosix`).
@@ -40,8 +45,18 @@ export function classifyCommit(input: ClassifyInput, cfg: ChestertonConfig): Cla
 
 // src/index-store.ts
 export function indexDir(repoRoot: string): string;            // absolute <git-dir>/chesterton, created if missing. Works in worktrees.
-export function loadIndex(repoRoot: string): ChestertonIndex | null;   // null if missing, corrupt, or wrong version
-export function saveIndex(repoRoot: string, idx: ChestertonIndex): void; // atomic write (tmp + rename)
+export function loadMeta(repoRoot: string): IndexMeta | null;  // meta.json only: head, builtAt, fixCommits, files. For SessionStart and status.
+export function loadIndexForFiles(repoRoot: string, relPaths: string[], opts?: { allCommits?: boolean }): ChestertonIndex | null;
+//   Only those files' shards and the fix commits they point at (or every fix commit with allCommits). What the hook reads.
+export function loadIndex(repoRoot: string): ChestertonIndex | null;   // every shard; null if missing, corrupt, or wrong version
+export function saveIndex(repoRoot: string, idx: ChestertonIndex): void; // atomic writes (tmp + rename), meta.json last
+//   Layout (index version 3), all in <git-dir>/chesterton/:
+//     meta.json            { version, id, head, builtAt, fixCommits, files }
+//     manifest-<id>.json   { version, id, files: { path: shard } }
+//     commits-<id>.json    { version, id, commits }
+//     shards/<hash>.json   { version, path, records, commits }  one file's records and the fix commits they name
+//   Shards are named by a hash of their content, so an incremental build only writes the ones that changed. A damaged shard
+//   is deleted when read, so the next build writes it again. Older generations and a version 2 index.json are removed.
 export function recordsForFile(idx: ChestertonIndex, relPath: string): FileFixRecord[];
 
 // src/index-builder.ts
@@ -51,7 +66,7 @@ export function buildIndex(repoRoot: string, cfg: ChestertonConfig, opts?: Build
 //   Uses a lock file in indexDir so two builds never run at once (second caller returns the existing index or waits briefly).
 //   Follows renames forward so records are keyed by the file's CURRENT path.
 //   Respects cfg.history, cfg.maxCommits, cfg.ignoreCommits. Skips merges, binary files, and noise files (isNoiseFile).
-export function isIndexFresh(repoRoot: string, idx: ChestertonIndex | null): boolean; // idx.head === HEAD
+export function isIndexFresh(repoRoot: string, idx: { head: string } | null): boolean; // idx.head === HEAD
 
 // src/blame.ts
 export function blameRange(repoRoot: string, relPath: string, start: number, end: number, timeoutMs?: number): BlameLine[];
@@ -69,7 +84,8 @@ export function diffLines(before: string[], after: string[]): { removed: { line:
 //   LCS based, exported so C's `check` command can reuse it.
 
 // src/analyze.ts
-export function analyzeChange(repoRoot: string, change: EditChange, idx: ChestertonIndex, cfg: ChestertonConfig): Finding[];
+export function analyzeChange(repoRoot: string, change: EditChange, idx: ChestertonIndex, cfg: ChestertonConfig, deps?: AnalyzeDeps): Finding[];
+//   deps: blame function and budget, current content, and alwaysBlame (the no-index fallback sets it).
 
 // src/decide.ts
 export interface HookResponse { stdout: string | null }  // JSON to print, or null for silent allow
@@ -105,7 +121,9 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
 
 ## Hook behavior
 
-- **SessionStart** (`startup|resume|clear|compact`): if not a repo, exit 0. If the index is missing or stale, spawn `node <dist>/cli.js index --quiet` detached and unref'd so the session never waits. Print nothing, or a one-line `additionalContext` only if an index already exists ("Chesterton: N fix commits indexed").
+- **SessionStart** (`startup|resume|clear|compact`): if not a repo or there is no HEAD, exit 0. The first SessionStart of a session
+  saves which files are already dirty, with a content hash (`baselines/<session>.json`), for the Stop sweep. It reads only
+  `meta.json`. If the index is missing or stale, spawn `node <dist>/cli.js index --quiet` detached and unref'd so the session never waits. Print nothing, or a one-line `additionalContext` only if an index already exists ("Chesterton: N fix commits indexed").
 - **PreToolUse** matcher `Edit|Write|MultiEdit`: build EditChange(s), analyze, decide.
   - No findings: silent exit 0.
   - Weak only: allow with `hookSpecificOutput.additionalContext` describing the fix commit(s).
@@ -114,8 +132,11 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
   - Strong in a `protect` path, or mode `ask`: `permissionDecision: "ask"` with the reason.
   - Mode `warn-only`: always allow, context only.
   - Whole thing wrapped in a timer (cfg.hookTimeoutMs); on overrun print nothing and exit 0.
-  - If the index is missing: fall back to blame only (removes-fix via blame + classify the blamed commits on the fly), capped by the timeout.
-- **Stop**: sweep `git diff HEAD` for files edited this session (from the session log), analyze each as whole-file changes, and if there are strong findings that were never surfaced, return `hookSpecificOutput.additionalContext` with a short ledger. Never block the stop in v1.
+  - Reads meta.json, the manifest and the edited files' shards, nothing else.
+  - If the index is missing: fall back to blame only (removes-fix via blame + classify the blamed commits on the fly, looking
+    each commit's lines up under the path the file had in that commit), capped by the timeout.
+- **Stop**: sweep `git diff HEAD` for files edited this session (from the session log) plus files that became dirty since
+  SessionStart or changed since then (edits made through the shell), analyze each as whole-file changes, and if there are strong findings that were never surfaced, return `hookSpecificOutput.additionalContext` with a short ledger. Never block the stop in v1.
 
 ## Detection rules
 
@@ -142,6 +163,8 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
   `.travis.yml`, `appveyor.yml`, `.circleci/`, `azure-pipelines.yml`, `.pre-commit-config.yaml`), and lockfiles.
 - `removes-fix` strong: a removed line's blame points at fix commit F and F's `added` contains that line's hash.
   weak: the removed line was last touched by F but hash not in F.added, or within 3 lines of a line F added.
+  Blame only runs when at least one removed line hashes to a line some fix added to this file, so these weak hits only
+  show up next to a possible strong one. That trade keeps ordinary edits free of git calls.
   Removals in test files are always weak.
 - A change whose removed and added text are identical once all whitespace is deleted (a reflow) yields no findings.
 - `re-adds-removed` strong: 2+ consecutive non-trivial added lines whose hashes appear in one fix commit's `removed` for this file (or its old paths), in order.

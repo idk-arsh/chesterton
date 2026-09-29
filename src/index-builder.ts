@@ -556,7 +556,7 @@ export function buildIndexDetailed(
 }
 
 /** True when idx was built at the current HEAD. */
-export function isIndexFresh(repoRoot: string, idx: ChestertonIndex | null): boolean {
+export function isIndexFresh(repoRoot: string, idx: { head: string } | null): boolean {
   if (!idx) return false;
   const head = headSha(repoRoot);
   return head !== null && idx.head === head;

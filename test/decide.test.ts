@@ -148,3 +148,35 @@ describe("matchGlob", () => {
     expect(matchGlob(path, glob)).toBe(want);
   });
 });
+
+describe("messages group findings by fix commit", () => {
+  const OTHER = "ffeeddccbbaa99887766554433221100ffeeddcc";
+  const readd = (sha = SHA): Finding => ({ ...finding("strong", "re-adds-removed", sha), lines: ["setTimeout(retry, 0); // spin until ready"] });
+
+  it("one fix that is both removed and re-added: counted once, one Fix block", () => {
+    const res = parse(decidePreToolUse([finding("strong"), readd()], fresh(), cfg(), "src/sock.ts").stdout)!;
+    const reason = res.permissionDecisionReason!;
+    expect(reason).toContain("this edit to src/sock.ts removes code that fix a1b2c3d added and adds back code it removed.");
+    expect(reason).not.toContain("touches 2 past bug fixes");
+    expect(reason.match(/^Fix: /gm)).toHaveLength(1);
+    expect(reason).toContain("Lines it removes:\n  if (sock.pending > 0) await flush(sock);");
+    expect(reason).toContain("Lines it adds back:\n  setTimeout(retry, 0); // spin until ready");
+    expect(reason).toContain("check the fix commit (git show a1b2c3d)");
+  });
+
+  it("two different fixes: counted as two, one block each", () => {
+    const res = parse(decidePreToolUse([finding("strong"), finding("strong", "removes-fix", OTHER), readd()], fresh(), cfg(), "src/sock.ts").stdout)!;
+    const reason = res.permissionDecisionReason!;
+    expect(reason).toContain("touches 2 past bug fixes");
+    expect(reason.match(/^Fix: /gm)).toHaveLength(2);
+    expect(reason).toContain("check the fix commits (git show a1b2c3d, git show ffeeddc)");
+  });
+
+  it("ask and context messages group the same way", () => {
+    const ask = parse(decidePreToolUse([finding("strong"), readd()], fresh(), cfg({ mode: "ask" }), "src/sock.ts").stdout)!;
+    expect(ask.permissionDecisionReason!.match(/^Fix: /gm)).toHaveLength(1);
+    expect(ask.permissionDecisionReason).not.toContain("past bug fixes");
+    const warn = parse(decidePreToolUse([finding("strong"), readd()], fresh(), cfg({ mode: "warn-only" }), "src/sock.ts").stdout)!;
+    expect(warn.additionalContext!.match(/Fix: /g)).toHaveLength(1);
+  });
+});

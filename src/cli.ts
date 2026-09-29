@@ -6,7 +6,7 @@ import { toPosix } from "./normalize.js";
 import { loadConfig, loadConfigWithWarnings } from "./config.js";
 import { buildIndexDetailed, isIndexFresh, isLockHeld } from "./index-builder.js";
 import { splitLines } from "./normalize.js";
-import { indexDir, loadIndex } from "./index-store.js";
+import { indexDir, loadIndex, loadIndexForFiles, loadMeta } from "./index-store.js";
 import { analyzeChange } from "./analyze.js";
 import { blameAt, gitDiffChanges } from "./diff-change.js";
 import { explainLine } from "./why.js";
@@ -218,7 +218,7 @@ function cmdWhy(io: CliIO, args: string[]): number {
     io.err(`chesterton: ${problem}`);
     return 1;
   }
-  io.out(explainLine(root, rel, line, loadIndex(root)));
+  io.out(explainLine(root, rel, line, loadIndexForFiles(root, [rel], { allCommits: true })));
   return 0;
 }
 
@@ -379,7 +379,7 @@ function cmdStatus(io: CliIO): number {
   if (!root) return 2;
   const head = headSha(root);
   const { config, warnings, found } = loadConfigWithWarnings(root);
-  const idx = loadIndex(root);
+  const idx = loadMeta(root);
   const lines = [`Repo:        ${root}`, `HEAD:        ${head ? head.slice(0, 7) : "(no commits)"}`];
   let dir = "";
   try {
@@ -394,8 +394,8 @@ function cmdStatus(io: CliIO): number {
     lines.push(`Index:       ${toPosix(dir)}`);
     lines.push(`Built at:    ${idx.builtAt} (HEAD ${idx.head.slice(0, 7) || "none"})`);
     lines.push(`Up to date:  ${fresh ? "yes" : "no, HEAD has moved. Run \"chesterton index\"."}`);
-    lines.push(`Fix commits: ${Object.keys(idx.commits).length}`);
-    lines.push(`Files:       ${Object.keys(idx.files).length}`);
+    lines.push(`Fix commits: ${idx.fixCommits}`);
+    lines.push(`Files:       ${idx.files}`);
   }
   lines.push(`Config:      ${found ? ".chesterton.yml" : "defaults (no .chesterton.yml)"}, mode ${config.mode}, history ${config.history}`);
   for (const w of warnings) lines.push(`  warning: ${w}`);

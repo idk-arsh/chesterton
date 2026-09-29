@@ -246,11 +246,39 @@ describe("buildIndex", () => {
     expect(Object.keys(idx.files)).toEqual(["src/x.ts"]);
   });
 
-  it("writes index version 2", () => {
+  it("writes index version 3", () => {
     const r = repo();
     r.write("a.ts", "export const v = 1;\n");
     r.commit("initial");
-    expect(buildIndex(r.dir, cfg).version).toBe(2);
+    expect(buildIndex(r.dir, cfg).version).toBe(3);
+  });
+
+  it("a version 2 index on disk triggers a clean full rebuild, and the old file is removed", () => {
+    const r = repo();
+    r.write("a.ts", "export const v = 1;\n");
+    r.commit("initial");
+    r.write("a.ts", "export const v = 1;\ncheckValueOne(v);\n");
+    const fix = r.commit("fix: one");
+    const head = r.git("rev-parse", "HEAD").trim();
+    // A version 2 index claiming to be at HEAD, with a commit that is not a fix at all.
+    const legacy = join(indexDir(r.dir), "index.json");
+    const bogus = "f".repeat(40);
+    writeFileSync(
+      legacy,
+      JSON.stringify({
+        version: 2,
+        head,
+        builtAt: "",
+        commits: { [bogus]: { sha: bogus, date: "", author: "", subject: "x", score: 9, reasons: [], refs: [], testFiles: [] } },
+        files: {},
+      }),
+    );
+    expect(loadIndex(r.dir)).toBeNull();
+    expect(isIndexFresh(r.dir, loadIndex(r.dir))).toBe(false);
+    const idx = buildIndex(r.dir, cfg);
+    expect(Object.keys(idx.commits)).toEqual([fix]);
+    expect(existsSync(legacy)).toBe(false);
+    expect(loadIndex(r.dir)?.head).toBe(head);
   });
 
   it("respects ignoreCommits and maxCommits", () => {

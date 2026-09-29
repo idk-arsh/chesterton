@@ -1,22 +1,22 @@
 // Hook entry point, bundled to dist/hook.js. Reads the hook JSON on stdin and prints a response.
 // Fails open: any error, timeout, or missing piece means exit 0 with no output.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { BlameLine, ChestertonConfig, ChestertonIndex, EditChange, Finding, FixCommit, LineEntry } from "./types.js";
+import type { BlameLine, ChestertonConfig, ChestertonIndex, EditChange, FileFixRecord, Finding, FixCommit, LineEntry } from "./types.js";
 import { INDEX_VERSION } from "./types.js";
 import { hashLine, isTrivial, normalizeLine, splitLines } from "./normalize.js";
-import { repoRoot as findRepoRoot, runGit, shallowInfo } from "./git.js";
+import { dirtyFiles, headSha, repoRoot as findRepoRoot, runGit, shallowInfo } from "./git.js";
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
-import { indexDir, loadIndex } from "./index-store.js";
-import { isIndexFresh } from "./index-builder.js";
+import { indexDir, loadIndexForFiles, loadMeta } from "./index-store.js";
 import { blameRange, parsePorcelain } from "./blame.js";
 import { classifyCommit, type CommitFileChange } from "./classify.js";
 import { changeFromToolCall, diffLines, toolPathToNative } from "./edit-diff.js";
 import { analyzeChange, type BlameFn } from "./analyze.js";
 import { decidePreToolUse } from "./decide.js";
-import { loadSession, saveSession, type SessionState } from "./session.js";
+import { loadBaseline, loadSession, saveBaseline, saveSession, type SessionState } from "./session.js";
 
 class HookTimeout extends Error {}
 
@@ -107,7 +107,7 @@ export function handleHookInput(raw: string, deps: HookDeps = {}): string | null
       return preToolUse(root, cfg, sessionId, input, deadline);
     }
     if (event === "SessionStart") {
-      return sessionStart(root, deps);
+      return sessionStart(root, sessionId, deps);
     }
     if (event === "Stop") {
       if (input.stop_hook_active === true) return null;
@@ -164,15 +164,13 @@ function samePath(a: string, b: string): boolean {
 
 // ---------- SessionStart ----------
 
-function sessionStart(root: string, deps: HookDeps): string | null {
-  const idx = loadIndex(root);
-  let fresh = false;
-  try {
-    fresh = idx !== null && isIndexFresh(root, idx);
-  } catch {
-    fresh = false;
-  }
-  if (!fresh) {
+function sessionStart(root: string, sessionId: string, deps: HookDeps): string | null {
+  // Without a HEAD (git missing, or no commits yet) there is nothing to index or check.
+  const head = headSha(root);
+  if (!head) return null;
+  snapshotDirty(root, sessionId);
+  const meta = loadMeta(root);
+  if (!meta || meta.head !== head) {
     const spawnIt = deps.spawnIndexer ?? defaultSpawnIndexer(deps.cliPath ?? join(scriptDir(), "cli.js"));
     try {
       spawnIt(root);
@@ -180,14 +178,52 @@ function sessionStart(root: string, deps: HookDeps): string | null {
       logError(root, err);
     }
   }
-  if (!idx) return null;
-  const n = Object.keys(idx.commits).length;
+  if (!meta) return null;
+  const n = meta.fixCommits;
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: "SessionStart",
       additionalContext: `Chesterton: ${n} fix commit${n === 1 ? "" : "s"} indexed. Edits that undo a past bug fix will be flagged.`,
     },
   });
+}
+
+/** Most dirty files whose content is hashed for the session baseline. */
+const MAX_BASELINE_HASHED = 300;
+/** Past this many dirty files the baseline is marked incomplete and shell changes are not swept. */
+const MAX_BASELINE_FILES = 5_000;
+/** Files bigger than this are not hashed; a change to them through the shell goes unchecked. */
+const MAX_HASH_BYTES = 2 * 1024 * 1024;
+
+/** Content hash of a working tree file, "deleted" when it is gone, null when too big or unreadable. */
+export function contentHash(root: string, relPath: string): string | null {
+  const file = join(root, relPath);
+  try {
+    if (statSync(file).size > MAX_HASH_BYTES) return null;
+    return createHash("sha1").update(readFileSync(file)).digest("hex");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "deleted" : null;
+  }
+}
+
+/**
+ * Remember which files were already dirty when the session started, so the Stop sweep can also
+ * check files changed later through the shell without flagging work that was there before.
+ * Kept from the first SessionStart of a session (resume and compact fire it again). Never throws.
+ */
+function snapshotDirty(root: string, sessionId: string): void {
+  try {
+    if (loadBaseline(root, sessionId)) return;
+    const dirty = dirtyFiles(root, 3_000);
+    const files: Record<string, string | null> = {};
+    let hashed = 0;
+    for (const f of dirty.slice(0, MAX_BASELINE_FILES)) {
+      files[f] = hashed++ < MAX_BASELINE_HASHED ? contentHash(root, f) : null;
+    }
+    saveBaseline(root, sessionId, { at: new Date().toISOString(), complete: dirty.length <= MAX_BASELINE_FILES, files });
+  } catch (err) {
+    logError(root, err);
+  }
 }
 
 // ---------- PreToolUse ----------
@@ -205,7 +241,7 @@ function preToolUse(
   if (changes.length === 0) return null;
   deadline.check();
 
-  const idx = loadIndex(root);
+  const idx = loadIndexForFiles(root, changes.map((c) => c.relPath));
   deadline.check();
   const session = loadSession(root, sessionId);
   const before = JSON.stringify(session);
@@ -256,17 +292,25 @@ function denyToContext(out: string | null): string | null {
   }
 }
 
-/** Blame wrapper that remembers results per range, so a second analysis pass costs nothing. */
-function memoBlame(deadline: Deadline, inner: BlameFn = blameRange): { fn: BlameFn; shas: Set<string> } {
+/**
+ * Blame wrapper that remembers results per range, so a second analysis pass costs nothing.
+ * Also collects, per blamed commit, the paths the file had in that commit.
+ */
+function memoBlame(deadline: Deadline, inner: BlameFn = blameRange): { fn: BlameFn; shas: Map<string, Set<string>> } {
   const cache = new Map<string, BlameLine[]>();
-  const shas = new Set<string>();
+  const shas = new Map<string, Set<string>>();
   const fn: BlameFn = (r, p, s, e) => {
     const key = `${p}:${s}-${e}`;
     const hit = cache.get(key);
     if (hit) return hit;
     const lines = inner(r, p, s, e, deadline.budget());
     cache.set(key, lines);
-    for (const l of lines) if (!/^0+$/.test(l.sha)) shas.add(l.sha);
+    for (const l of lines) {
+      if (/^0+$/.test(l.sha)) continue;
+      let paths = shas.get(l.sha);
+      if (!paths) shas.set(l.sha, (paths = new Set()));
+      paths.add(l.origPath || p);
+    }
     return lines;
   };
   return { fn, shas };
@@ -303,12 +347,12 @@ function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfi
   const empty: ChestertonIndex = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: {} };
   const removalOnly: EditChange = { ...change, added: [] };
   // First pass only collects blame.
-  analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn });
+  analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn, alwaysBlame: true });
 
   const idx: ChestertonIndex = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
   let n = 0;
   let shallow: { shallow: boolean; boundary: Set<string> } | null = null;
-  for (const sha of blame.shas) {
+  for (const [sha, paths] of blame.shas) {
     if (n++ >= MAX_FALLBACK_COMMITS) break;
     if (cfg.ignoreCommits.some((p) => p && sha.startsWith(p))) continue;
     const meta = runGit(["show", "-s", "--format=%H%x00%aI%x00%an%x00%P%x00%s%x00%b", sha], root, deadline.budget());
@@ -322,12 +366,17 @@ function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfi
     if (!res.isFix) continue;
     const fix: FixCommit = { sha: full, date, author, subject, score: res.score, reasons: res.reasons, refs: res.refs, testFiles: res.testFiles };
     idx.commits[full] = fix;
-    const added = addedLinesInCommit(root, full, change.relPath, deadline.budget());
-    idx.files[change.relPath]!.push({ sha: full, path: change.relPath, added, removed: [] });
+    // Look the lines up under the path the file had in that commit, so a fix made before a
+    // rename still counts.
+    for (const path of paths) {
+      const added = addedLinesInCommit(root, full, path, deadline.budget());
+      const rec: FileFixRecord = { sha: full, path, added, removed: [] };
+      idx.files[change.relPath]!.push(rec);
+    }
   }
   if (Object.keys(idx.commits).length === 0) return [];
   deadline.check();
-  return analyzeChange(root, removalOnly, idx, cfg, { blame: blame.fn });
+  return analyzeChange(root, removalOnly, idx, cfg, { blame: blame.fn, alwaysBlame: true });
 }
 
 function parseNumstat(text: string): CommitFileChange[] {
@@ -352,6 +401,36 @@ function shortVerb(f: Finding): string {
   return f.kind === "removes-fix" ? "removes code added by fix" : "adds back code removed by fix";
 }
 
+/**
+ * Files the Stop sweep looks at: those edited through Edit/Write this session, plus files that
+ * became dirty since the session started (changed through the shell, say). A file that was already
+ * dirty at the start only counts when its content has changed since. Past the cap, files edited
+ * through the tools win, newest first.
+ */
+function stopCandidates(root: string, session: SessionState, deadline: Deadline): string[] {
+  const edited = new Set(session.files);
+  const out: string[] = [];
+  const base = loadBaseline(root, session.sessionId);
+  if (base && base.complete) {
+    let dirty: string[] = [];
+    try {
+      dirty = dirtyFiles(root, Math.min(3_000, deadline.budget()));
+    } catch {
+      dirty = [];
+    }
+    for (const f of dirty) {
+      if (edited.has(f)) continue;
+      if (Object.prototype.hasOwnProperty.call(base.files, f)) {
+        const was = base.files[f];
+        if (was === null || was === undefined || contentHash(root, f) === was) continue;
+      }
+      out.push(f);
+    }
+  }
+  out.push(...session.files);
+  return out.slice(-MAX_STOP_FILES);
+}
+
 function stop(
   root: string,
   cfg: ChestertonConfig,
@@ -359,14 +438,15 @@ function stop(
   deadline: Deadline,
 ): { text: string; commit: () => void } | null {
   const session: SessionState = loadSession(root, sessionId);
-  if (session.files.length === 0) return null;
-  const idx = loadIndex(root);
+  const files = stopCandidates(root, session, deadline);
+  if (files.length === 0) return null;
+  const idx = loadIndexForFiles(root, files);
   if (!idx) return null;
   const seen = new Set([...session.acknowledged, ...session.findings.map((f) => f.key)]);
   const ledger: Finding[] = [];
   const blame: BlameFn = (r, p, s, e) => blameAtHead(r, p, s, e, deadline.budget());
 
-  for (const rel of session.files.slice(-MAX_STOP_FILES)) {
+  for (const rel of files) {
     deadline.check();
     let headText: string | null = null;
     try {
@@ -412,7 +492,7 @@ function stop(
   };
   const items = ledger.map((f) => `- ${f.file}: ${shortVerb(f)} ${f.fix.sha.slice(0, 7)} "${f.fix.subject}" (git show ${f.fix.sha.slice(0, 7)})`);
   const text =
-    `Chesterton: before you finish, ${ledger.length === 1 ? "one change" : `${ledger.length} changes`} from this session touch past bug fixes that were not flagged at edit time:\n` +
+    `Chesterton: before you finish, ${ledger.length === 1 ? "one change from this session touches a past bug fix that was" : `${ledger.length} changes from this session touch past bug fixes that were`} not flagged at edit time:\n` +
     `${items.join("\n")}\n` +
     `Check each fix still holds, and tell the user if you removed or reverted one on purpose.`;
   return { text: JSON.stringify({ hookSpecificOutput: { hookEventName: "Stop", additionalContext: text } }), commit };

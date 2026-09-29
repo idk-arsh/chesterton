@@ -1,12 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
 import { handleHookInput } from "../src/hook.js";
-import { loadSession } from "../src/session.js";
+import { baselinePath, loadBaseline, loadSession, saveBaseline } from "../src/session.js";
 import { buildIndex } from "../src/index-builder.js";
 import { saveIndex } from "../src/index-store.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
@@ -199,5 +199,120 @@ describe("bundled hook process", () => {
       expect(o.permissionDecision).toBe("deny");
       expect(o.permissionDecisionReason).toContain(fix.slice(0, 7));
     }
+  });
+});
+
+describe("speed paths", () => {
+  it("SessionStart reads only meta.json: the count shows even when the shards are gone", () => {
+    const { r } = fixRepo(true);
+    const dir = join(r.dir, ".git", "chesterton");
+    for (const f of readdirSync(dir)) if (/^(manifest|commits)-/.test(f)) rmSync(join(dir, f));
+    rmSync(join(dir, "shards"), { recursive: true, force: true });
+    let spawned = 0;
+    const res = out(handleHookInput(JSON.stringify({ session_id: "m", cwd: r.dir, hook_event_name: "SessionStart" }), { spawnIndexer: () => spawned++ }));
+    expect(res.additionalContext).toContain("1 fix commit indexed");
+    expect(spawned).toBe(0);
+  });
+
+  it("SessionStart with only a version 2 index.json: rebuilds instead of crashing", () => {
+    const { r } = fixRepo(false);
+    const dir = join(r.dir, ".git", "chesterton");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "index.json"), JSON.stringify({ version: 2, head: r.git("rev-parse", "HEAD").trim(), builtAt: "", commits: {}, files: {} }));
+    let spawned = 0;
+    expect(handleHookInput(JSON.stringify({ session_id: "v2", cwd: r.dir, hook_event_name: "SessionStart" }), { spawnIndexer: () => spawned++ })).toBeNull();
+    expect(spawned).toBe(1);
+  });
+
+  it("PreToolUse only needs the edited file's shard", () => {
+    const { r, fix } = fixRepo(true);
+    r.write("src/other.ts", "export const x = 1;\n");
+    r.commit("initial other");
+    r.write("src/other.ts", "export const x = 1;\nassertPositive(x);\n");
+    r.commit("fix: crash on negative x");
+    saveIndex(r.dir, buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true }));
+    const dir = join(r.dir, ".git", "chesterton");
+    const manifest = JSON.parse(readFileSync(join(dir, readdirSync(dir).find((f) => f.startsWith("manifest-"))!), "utf8"));
+    writeFileSync(join(dir, "shards", `${manifest.files["src/other.ts"]}.json`), "{ damaged");
+    const res = out(handleHookInput(pre(r, { file_path: "src/sock.ts", old_string: `${GUARD1}\n`, new_string: "" }, "shard"), deps()));
+    expect(res.permissionDecision).toBe("deny");
+    expect(res.permissionDecisionReason).toContain(fix.slice(0, 7));
+  });
+
+  it("no-index fallback finds a fix made before the file was renamed", () => {
+    const { r, fix } = fixRepo(false);
+    r.mv("src/sock.ts", "lib/socket.ts");
+    r.commit("refactor: move socket code");
+    const res = out(handleHookInput(pre(r, { file_path: "lib/socket.ts", old_string: `${GUARD1}\n${GUARD2}\n`, new_string: "" }, "renamed"), deps()));
+    expect(res.permissionDecision).toBe("deny");
+    expect(res.permissionDecisionReason).toContain(fix.slice(0, 7));
+  });
+});
+
+describe("Stop sweep and files changed outside the edit tools", () => {
+  const start = (r: TestRepo, id: string) =>
+    handleHookInput(JSON.stringify({ session_id: id, cwd: r.dir, hook_event_name: "SessionStart", source: "startup" }), { spawnIndexer: () => {} });
+  const stopRun = (r: TestRepo, id: string) => out(handleHookInput(JSON.stringify({ session_id: id, cwd: r.dir, hook_event_name: "Stop" }), deps()));
+
+  it("reports a fix removed through the shell after the session started", () => {
+    const { r, fix } = fixRepo(true);
+    start(r, "bash1");
+    // No Edit or Write: the file changes on disk, as a sed or a script would do it.
+    r.write("src/sock.ts", FIXED.replace(`${GUARD1}\n`, ""));
+    const res = stopRun(r, "bash1");
+    expect(res.additionalContext).toContain("src/sock.ts");
+    expect(res.additionalContext).toContain(fix.slice(0, 7));
+    expect(res.additionalContext).toContain("one change from this session touches a past bug fix that was not flagged");
+    expect(stopRun(r, "bash1")).toBeNull();
+  });
+
+  it("leaves alone a file that was already dirty at session start and has not changed since", () => {
+    const { r } = fixRepo(true);
+    r.write("src/sock.ts", FIXED.replace(`${GUARD1}\n`, ""));
+    start(r, "bash2");
+    expect(stopRun(r, "bash2")).toBeNull();
+    // A later change to that same file does count.
+    r.write("src/sock.ts", FIXED.replace(`${GUARD1}\n`, "").replace(`${GUARD2}\n`, ""));
+    const res = stopRun(r, "bash2");
+    expect(res.additionalContext).toContain("src/sock.ts");
+  });
+
+  it("a second SessionStart (resume, compact) keeps the first snapshot", () => {
+    const { r } = fixRepo(true);
+    start(r, "bash3");
+    r.write("src/sock.ts", FIXED.replace(`${GUARD1}\n`, ""));
+    start(r, "bash3");
+    expect(stopRun(r, "bash3")?.additionalContext).toContain("src/sock.ts");
+  });
+
+  it("an incomplete snapshot (too many dirty files) skips shell changes; a damaged one is ignored", () => {
+    const { r } = fixRepo(true);
+    saveBaseline(r.dir, "big", { at: new Date().toISOString(), complete: false, files: {} });
+    r.write("src/sock.ts", FIXED.replace(`${GUARD1}
+`, ""));
+    expect(stopRun(r, "big")).toBeNull();
+    writeFileSync(baselinePath(r.dir, "bad"), "{ damaged");
+    expect(loadBaseline(r.dir, "bad")).toBeNull();
+    expect(stopRun(r, "bad")).toBeNull();
+  });
+
+  it("without a snapshot, only files edited through the tools are swept", () => {
+    const { r } = fixRepo(true);
+    r.write("src/sock.ts", FIXED.replace(`${GUARD1}\n`, ""));
+    expect(stopRun(r, "nosnap")).toBeNull();
+  });
+
+  it("plural wording when several changes touch fixes", () => {
+    const { r } = fixRepo(true);
+    r.write("src/b.ts", "export const b = 1;\n");
+    r.commit("initial b");
+    r.write("src/b.ts", "export const b = 1;\nassertPositive(b);\n");
+    r.commit("fix: crash on negative b (#7)");
+    saveIndex(r.dir, buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true }));
+    start(r, "bash4");
+    r.write("src/sock.ts", FIXED.replace(`${GUARD1}\n`, ""));
+    r.write("src/b.ts", "export const b = 1;\n");
+    const res = stopRun(r, "bash4");
+    expect(res.additionalContext).toContain("2 changes from this session touch past bug fixes that were not flagged");
   });
 });

@@ -1,6 +1,7 @@
 ---
 name: chesterton
 description: What to do when a Chesterton message blocks or annotates an Edit or Write ("Chesterton:", "undo a past bug fix", "fix commit"), and how to check git history before removing code that looks odd. Use when refactoring, simplifying, cleaning up, or deleting code that looks pointless, such as a sleep, a retry, an extra null check, a lock, or a strange guard.
+allowed-tools: Bash(node *), Bash(git show *), Bash(git log *), Bash(git blame *)
 ---
 
 # Chesterton

@@ -103,7 +103,9 @@ that a fix removed, removing lines from a test file) don't block anything. They 
 Claude as a note. An edit that only re-wraps or re-indents code is ignored.
 
 **When the session ends**, a Stop hook sweeps the files Claude changed against HEAD, so a fix taken
-apart across several small edits still shows up in a short summary.
+apart across several small edits still shows up in a short summary. That includes files changed
+through the shell, such as a `sed` or a script, but not files that were already changed before the
+session started and haven't changed since.
 
 **It fails open.** If git is missing, the folder isn't a repo, the index isn't built yet, or anything
 throws or runs past its time budget, the hook exits quietly and your edit goes through. Chesterton

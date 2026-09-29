@@ -100,7 +100,8 @@ describe("repo shapes", () => {
     expect(
       handleHookInput(JSON.stringify({ cwd: r.dir, hook_event_name: "SessionStart" }), { spawnIndexer: () => spawned++ }),
     ).toBeNull();
-    expect(spawned).toBe(1);
+    // Nothing to index without a commit, so no indexer is started.
+    expect(spawned).toBe(0);
     expect(buildIndex(r.dir, { ...DEFAULT_CONFIG }).head).toBe("");
     expect(handleHookInput(JSON.stringify({ cwd: r.dir, session_id: "z", hook_event_name: "Stop" }), deps())).toBeNull();
   });

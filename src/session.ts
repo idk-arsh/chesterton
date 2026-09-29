@@ -124,3 +124,44 @@ export function saveSession(repoRoot: string, s: SessionState): void {
   }
   writeAtomic(fallbackSessionPath(repoRoot, s.sessionId), text);
 }
+
+// ---------- dirty file baseline ----------
+
+/**
+ * Files that were already changed when a session started, with a hash of their content then.
+ * The Stop sweep also checks files that became dirty later (changed through the shell, say) and
+ * uses this to leave alone what was dirty before the session touched anything. Kept in its own
+ * file so the edit hook never has to read it.
+ */
+export interface DirtyBaseline {
+  at: string;
+  /** False when there were too many dirty files to record; the sweep then skips shell changes. */
+  complete: boolean;
+  /** Repo-relative path to content hash at session start; null when the hash was not taken. */
+  files: Record<string, string | null>;
+}
+
+export function baselinePath(repoRoot: string, sessionId: string): string {
+  return join(indexDir(repoRoot), "baselines", `${sanitizeSessionId(sessionId)}.json`);
+}
+
+/** The session's baseline, or null when none was saved or it cannot be read. Never throws. */
+export function loadBaseline(repoRoot: string, sessionId: string): DirtyBaseline | null {
+  try {
+    const raw = JSON.parse(readFileSync(baselinePath(repoRoot, sessionId), "utf8")) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object" || typeof raw.at !== "string" || typeof raw.complete !== "boolean") return null;
+    if (!raw.files || typeof raw.files !== "object" || Array.isArray(raw.files)) return null;
+    const files: Record<string, string | null> = {};
+    for (const [k, v] of Object.entries(raw.files as Record<string, unknown>)) {
+      if (typeof v === "string" || v === null) files[k] = v;
+    }
+    return { at: raw.at, complete: raw.complete, files };
+  } catch {
+    return null;
+  }
+}
+
+/** Save the baseline atomically. Throws when it cannot be written. */
+export function saveBaseline(repoRoot: string, sessionId: string, b: DirtyBaseline): void {
+  writeAtomic(baselinePath(repoRoot, sessionId), JSON.stringify(b));
+}
