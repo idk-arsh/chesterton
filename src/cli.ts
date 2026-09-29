@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { repoRoot as findRepoRoot, runGit } from "./git.js";
 import { toPosix } from "./normalize.js";
@@ -10,6 +10,7 @@ import { indexDir, loadIndex, loadIndexForFiles, loadMeta } from "./index-store.
 import { analyzeChange } from "./analyze.js";
 import { blameAt, gitDiffChanges } from "./diff-change.js";
 import { explainLine } from "./why.js";
+import { resolveRepoPath, toolPathToNative } from "./edit-diff.js";
 import { capList } from "./decide.js";
 import type { ChestertonIndex, Finding } from "./types.js";
 import { armWatchdog } from "./watchdog.js";
@@ -194,23 +195,14 @@ export function parseFileLine(args: string[]): { file: string; line: number } {
   return { file, line };
 }
 
+/**
+ * The repo-relative path of a `why` argument, or null when it is outside the repo. Shares the hook's
+ * resolution (native realpath on both sides), since the root comes back with links resolved and 8.3
+ * short names expanded while the argument uses whatever path the shell is in.
+ */
 function toRepoPath(root: string, cwd: string, file: string): string | null {
-  const abs = isAbsolute(file) ? file : resolve(cwd, file);
-  let rootReal = root;
-  let absReal = abs;
-  try {
-    rootReal = realpathSync(root);
-  } catch {
-    /* keep as is */
-  }
-  try {
-    absReal = realpathSync(abs);
-  } catch {
-    /* file may not exist; explainLine reports that */
-  }
-  const rel = relative(rootReal, absReal);
-  if (rel.startsWith("..") || isAbsolute(rel)) return null;
-  return toPosix(rel);
+  const p = toolPathToNative(file);
+  return resolveRepoPath(root, isAbsolute(p) ? p : resolve(cwd, p))?.rel ?? null;
 }
 
 function cmdWhy(io: CliIO, args: string[]): number {

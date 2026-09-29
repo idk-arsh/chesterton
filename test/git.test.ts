@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.setConfig({ testTimeout: 60_000 });
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { dirtyFiles, findRepoInJs, locateRepo, repoRoot, runGit } from "../src/git.js";
 import { indexDir } from "../src/index-store.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
+import { linkTo, shortPathOf } from "./helpers/alias.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -42,6 +43,28 @@ describe("finding the repo without starting git", () => {
       expect(loc).not.toBeNull();
       expect(loc!.root).toBe(want);
       expect(same(loc!.gitDir, wantGitDir)).toBe(true);
+    }
+  });
+
+  // Was a bug (CI on macOS and Windows): root came back resolved but gitDir kept the link or 8.3
+  // short name it was reached through, so the two disagreed with each other and with git.
+  it("resolves root and gitDir the way git does when reached through a link or a short name", () => {
+    const r = repo();
+    r.write("src/a.ts", "x\n");
+    r.commit("initial");
+    const want = r.git("rev-parse", "--show-toplevel").trim();
+    const wantGitDir = r.git("rev-parse", "--absolute-git-dir").trim();
+    const link = linkTo(r.dir);
+    cleanups.push(link.cleanup);
+    const forms = [link.path, shortPathOf(r.dir)].filter((p): p is string => !!p);
+    for (const base of forms) {
+      for (const cwd of [base, join(base, "src")]) {
+        const loc = findRepoInJs(cwd);
+        expect(loc, cwd).not.toBeNull();
+        expect(loc!.root).toBe(want);
+        expect(loc!.gitDir).toBe(wantGitDir);
+        expect(same(indexDir(cwd), join(wantGitDir, "chesterton"))).toBe(true);
+      }
     }
   });
 
@@ -89,8 +112,9 @@ describe("finding the repo without starting git", () => {
     writeFileSync(join(sub, ".git"), "gitdir: ../../.git/modules/lib\n");
     const loc = findRepoInJs(sub);
     expect(loc).not.toBeNull();
-    expect(same(loc!.root, sub)).toBe(true);
-    expect(same(loc!.gitDir, modDir)).toBe(true);
+    // Both come back resolved, like git prints them, even when the temp dir is a link or a short name.
+    expect(same(loc!.root, realpathSync.native(sub))).toBe(true);
+    expect(same(loc!.gitDir, realpathSync.native(modDir))).toBe(true);
   });
 
   it("hands unusual layouts to git: broken .git file, GIT_DIR, core.worktree", () => {

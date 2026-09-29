@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { main, type CliIO } from "../src/cli.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
+import { linkTo, shortPathOf } from "./helpers/alias.js";
 
 const CLI_JS = join(fileURLToPath(new URL(".", import.meta.url)), "..", "dist", "cli.js");
 const GUARD = "  await sleep(50); // wait for the kernel to drain the buffer";
@@ -145,6 +146,37 @@ describe("why", () => {
     const res = run(["why", "socket.ts:3"], join(r.dir, "src"));
     expect(res.code).toBe(0);
     expect(res.out).toContain("src/socket.ts:3");
+  });
+
+  // Was a bug (wrong result, CI on Windows and macOS): git reports the repo root with links resolved
+  // and 8.3 short names expanded, but `why` resolved the argument with the JS realpath, which keeps
+  // short names, and not at all for a missing file. So a repo reached through a short path, a junction
+  // or a symlink (macOS /tmp) got "is outside this repository".
+  it("repo reached through a junction, symlink or 8.3 short path: answers instead of saying outside", () => {
+    const r = fixRepo();
+    const link = linkTo(r.dir);
+    cleanups.push(link.cleanup);
+    const forms = [link.path];
+    const short = shortPathOf(r.dir);
+    if (short) forms.push(short);
+    for (const dir of forms) {
+      for (const [argv, cwd] of [
+        [["why", "src/socket.ts:3"], dir],
+        [["why", "socket.ts:3"], join(dir, "src")],
+        [["why", `${join(dir, "src", "socket.ts")}:3`], dir],
+        [["why", `${join(dir, "src", "socket.ts")}:3`], r.dir],
+        [["why", `${join(r.dir, "src", "socket.ts")}:3`], dir],
+      ] as [string[], string][]) {
+        const res = run(argv, cwd);
+        expect(res.err, `${argv.join(" ")} in ${cwd}`).toBe("");
+        expect(res.code).toBe(0);
+        expect(res.out).toContain("race on socket close");
+      }
+      // A missing file is reported as missing, not as outside the repo.
+      const missing = run(["why", "src/missing.ts:1"], dir);
+      expect(missing.code).toBe(1);
+      expect(missing.err).not.toContain("outside");
+    }
   });
 
   it("file outside the repo: exit 2", () => {

@@ -1,6 +1,6 @@
 // src/cli.ts
-import { readFileSync as readFileSync8, realpathSync as realpathSync2, statSync as statSync4 } from "node:fs";
-import { isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
+import { readFileSync as readFileSync9, realpathSync as realpathSync3, statSync as statSync5 } from "node:fs";
+import { isAbsolute as isAbsolute3, resolve as resolve3 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/git.ts
@@ -86,13 +86,14 @@ function hasUnusualConfig(gitDir) {
   }
   return false;
 }
+var slashes = (p) => process.platform === "win32" ? p.replace(/\\/g, "/") : p;
 function gitStylePath(p) {
   let r = p;
   try {
     r = realpathSync.native(p);
   } catch {
   }
-  return process.platform === "win32" ? r.replace(/\\/g, "/") : r;
+  return slashes(r);
 }
 function findRepoInJs(cwd) {
   for (const v of GIT_DISCOVERY_ENV) if (process.env[v]) throw new NeedGit(`${v} is set`);
@@ -109,7 +110,8 @@ function findRepoInJs(cwd) {
     }
     if (gitDir) {
       if (hasUnusualConfig(gitDir)) throw new NeedGit("unusual config");
-      return { root: gitStylePath(dir), gitDir };
+      const root = gitStylePath(dir);
+      return { root, gitDir: gitDir === dotGit ? slashes(join(root, ".git")) : gitStylePath(gitDir) };
     }
     const up = dirname(dir);
     if (up === dir) return null;
@@ -2006,6 +2008,80 @@ function day(iso) {
   return iso ? iso.slice(0, 10) : "unknown date";
 }
 
+// src/edit-diff.ts
+import { lstatSync, readdirSync as readdirSync2, readFileSync as readFileSync8, realpathSync as realpathSync2, statSync as statSync4 } from "node:fs";
+import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join8, relative, resolve as resolve2 } from "node:path";
+var MAX_FILE_BYTES = 5 * 1024 * 1024;
+function toolPathToNative(p) {
+  if (process.platform === "win32") {
+    const m = /^\/([a-zA-Z])(\/.*)?$/.exec(p);
+    if (m) return `${m[1]}:${m[2] ?? "/"}`;
+  }
+  return p;
+}
+function realOr(p) {
+  try {
+    return realpathSync2.native(p);
+  } catch {
+    return p;
+  }
+}
+function realPathOf(abs) {
+  try {
+    if (!lstatSync(abs).isSymbolicLink()) return realpathSync2.native(abs);
+    return join8(realOr(dirname2(abs)), basename2(abs));
+  } catch {
+  }
+  const rest = [];
+  let cur = abs;
+  for (; ; ) {
+    const up = dirname2(cur);
+    rest.unshift(basename2(cur));
+    if (up === cur) return abs;
+    cur = up;
+    try {
+      return join8(realpathSync2.native(cur), ...rest);
+    } catch {
+    }
+  }
+}
+function trueCase(rootReal, rel) {
+  if (process.platform !== "darwin") return rel;
+  const parts = rel.split(/[\\/]/);
+  let dir = rootReal;
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    let name = part;
+    try {
+      const names = readdirSync2(dir);
+      if (!names.includes(part)) {
+        const lower = part.toLowerCase();
+        const hit = names.find((n) => n.toLowerCase() === lower);
+        if (hit) name = hit;
+        else return [...out, ...parts.slice(i)].join("/");
+      }
+    } catch {
+      return [...out, ...parts.slice(i)].join("/");
+    }
+    out.push(name);
+    dir = join8(dir, name);
+  }
+  return out.join("/");
+}
+function resolveRepoPath(repoRoot2, filePath) {
+  if (typeof filePath !== "string" || filePath.trim() === "") return null;
+  const p = toolPathToNative(filePath.trim());
+  const rootReal = realOr(resolve2(repoRoot2));
+  const abs = realPathOf(isAbsolute2(p) ? resolve2(p) : resolve2(repoRoot2, p));
+  let rel = relative(rootReal, abs);
+  if (rel === "" || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute2(rel)) return null;
+  rel = trueCase(rootReal, rel);
+  const posix = toPosix(rel);
+  if (posix === ".git" || posix.startsWith(".git/")) return null;
+  return { abs, rel: posix };
+}
+
 // src/watchdog.ts
 import { Worker } from "node:worker_threads";
 function armWatchdog(ms) {
@@ -2170,20 +2246,8 @@ function parseFileLine(args) {
   return { file, line };
 }
 function toRepoPath(root, cwd, file) {
-  const abs = isAbsolute2(file) ? file : resolve2(cwd, file);
-  let rootReal = root;
-  let absReal = abs;
-  try {
-    rootReal = realpathSync2(root);
-  } catch {
-  }
-  try {
-    absReal = realpathSync2(abs);
-  } catch {
-  }
-  const rel = relative(rootReal, absReal);
-  if (rel.startsWith("..") || isAbsolute2(rel)) return null;
-  return toPosix(rel);
+  const p = toolPathToNative(file);
+  return resolveRepoPath(root, isAbsolute3(p) ? p : resolve3(cwd, p))?.rel ?? null;
 }
 function cmdWhy(io, args) {
   const { file, line } = parseFileLine(args);
@@ -2203,17 +2267,17 @@ function cmdWhy(io, args) {
   return 0;
 }
 function whyProblem(root, rel, line) {
-  const full = resolve2(root, rel);
+  const full = resolve3(root, rel);
   let st;
   try {
-    st = statSync4(full);
+    st = statSync5(full);
   } catch {
     return `${rel}: file not found in the working tree.`;
   }
   if (st.isDirectory()) return `${rel} is a directory, not a file.`;
   let count;
   try {
-    count = splitLines(readFileSync8(full, "utf8")).length;
+    count = splitLines(readFileSync9(full, "utf8")).length;
   } catch (e) {
     return `${rel}: cannot read the file (${e.message}).`;
   }
@@ -2392,7 +2456,7 @@ function isEntryPoint() {
   const script = process.argv[1];
   if (!script) return false;
   try {
-    return realpathSync2(script) === realpathSync2(fileURLToPath(import.meta.url));
+    return realpathSync3(script) === realpathSync3(fileURLToPath(import.meta.url));
   } catch {
     return false;
   }

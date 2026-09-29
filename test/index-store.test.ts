@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
 import { emptyIndex, indexDir, loadIndex, loadIndexForFiles, loadMeta, recordsForFile, saveIndex } from "../src/index-store.js";
@@ -26,7 +26,8 @@ describe("index-store", () => {
     const r = repo();
     const dir = indexDir(r.dir);
     expect(isAbsolute(dir)).toBe(true);
-    expect(resolve(dir)).toBe(resolve(r.dir, ".git", "chesterton"));
+    // Links and 8.3 short names in the temp path come back resolved, the way git prints the git dir.
+    expect(resolve(dir)).toBe(resolve(realpathSync.native(r.dir), ".git", "chesterton"));
     expect(existsSync(dir)).toBe(true);
   });
 
@@ -41,7 +42,7 @@ describe("index-store", () => {
       expect(isAbsolute(dir)).toBe(true);
       expect(existsSync(dir)).toBe(true);
       expect(resolve(dir)).not.toBe(resolve(indexDir(r.dir)));
-      expect(resolve(dir).startsWith(resolve(r.dir, ".git"))).toBe(true);
+      expect(resolve(dir).startsWith(resolve(realpathSync.native(r.dir), ".git"))).toBe(true);
     } finally {
       r.git("worktree", "remove", "--force", wt);
     }

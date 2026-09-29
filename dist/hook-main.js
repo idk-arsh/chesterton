@@ -176,13 +176,14 @@ function hasUnusualConfig(gitDir) {
   }
   return false;
 }
+var slashes = (p) => process.platform === "win32" ? p.replace(/\\/g, "/") : p;
 function gitStylePath(p) {
   let r = p;
   try {
     r = realpathSync.native(p);
   } catch {
   }
-  return process.platform === "win32" ? r.replace(/\\/g, "/") : r;
+  return slashes(r);
 }
 function findRepoInJs(cwd) {
   for (const v of GIT_DISCOVERY_ENV) if (process.env[v]) throw new NeedGit(`${v} is set`);
@@ -199,7 +200,8 @@ function findRepoInJs(cwd) {
     }
     if (gitDir) {
       if (hasUnusualConfig(gitDir)) throw new NeedGit("unusual config");
-      return { root: gitStylePath(dir), gitDir };
+      const root = gitStylePath(dir);
+      return { root, gitDir: gitDir === dotGit ? slashes(join(root, ".git")) : gitStylePath(gitDir) };
     }
     const up = dirname(dir);
     if (up === dir) return null;

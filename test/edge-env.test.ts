@@ -14,6 +14,9 @@ import { indexDir, loadIndex } from "../src/index-store.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { runGit } from "../src/git.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
+import { linkTo, shortNamesAvailable, shortPathOf } from "./helpers/alias.js";
+
+const hasShortNames = shortNamesAvailable();
 
 const GUARD = "  if (sock.pending > 0) await flush(sock);";
 const BEFORE = ["function close(sock) {", "  sock.end();", "  cleanup(sock);", "}"];
@@ -227,6 +230,37 @@ describe("repo shapes", () => {
     expect(decision(edit(link, join(link, "src", "sock.ts"), GUARD + "\n", "", "link"))).toBe("deny");
   });
 
+  // Was a bug on CI (macOS /var -> /private/var, Windows 8.3 TEMP): the repo root comes back resolved
+  // while Claude Code passes file_path in whatever form the session was opened with. Every mix of
+  // real and unresolved cwd and file_path must still find the fix, with and without an index.
+  it("cwd and file_path in different forms (real path vs junction or symlink): deny either way", () => {
+    for (const index of [true, false]) {
+      const r = fixRepo("src/sock.ts", "\n", { index });
+      const link = linkTo(r.dir);
+      cleanups.push(link.cleanup);
+      const pairs: [string, string][] = [
+        [r.dir, join(link.path, "src", "sock.ts")],
+        [link.path, join(r.dir, "src", "sock.ts")],
+        [link.path, join(link.path, "src", "sock.ts")],
+        [link.path, "src/sock.ts"],
+      ];
+      pairs.forEach(([cwd, fp], i) => expect(decision(edit(cwd, fp, GUARD + "\n", "", `mix-${index}-${i}`)), `${cwd} ${fp}`).toBe("deny"));
+    }
+  });
+
+  it.skipIf(!hasShortNames)("8.3 short name paths on Windows: deny whether cwd, file_path or both are short", () => {
+    const r = fixRepo();
+    const short = shortPathOf(r.dir)!;
+    expect(short).toBeTruthy();
+    const pairs: [string, string][] = [
+      [r.dir, join(short, "src", "sock.ts")],
+      [short, join(r.dir, "src", "sock.ts")],
+      [short, join(short, "src", "sock.ts")],
+      [short, "src/sock.ts"],
+    ];
+    pairs.forEach(([cwd, fp], i) => expect(decision(edit(cwd, fp, GUARD + "\n", "", `short-${i}`)), `${cwd} ${fp}`).toBe("deny"));
+  });
+
   it("very long repo path (> 260 chars): hook fails open, never throws", () => {
     // Windows cannot start a process whose cwd is longer than MAX_PATH, so every git call fails there
     // (spawnSync git ENOENT). That is a platform limit; what matters is the hook stays silent.
@@ -266,11 +300,13 @@ describe("path shapes", () => {
   // Was a bug (wrong result, low): on case-insensitive file systems (Windows, default macOS) a file_path whose
   // directory or file name case differs from git's ("SRC/Sock.ts" for "src/sock.ts") reads fine from
   // disk but misses the index key and git blame, so the fix is not seen.
-  it("file_path with different letter case on a case-insensitive file system still matches", () => {
-    if (process.platform !== "win32" && process.platform !== "darwin") throw new Error("case-sensitive FS");
-    const r = fixRepo();
-    expect(decision(edit(r.dir, join(r.dir, "SRC", "Sock.ts"), GUARD + "\n", "", "case"))).toBe("deny");
-  });
+  it.skipIf(process.platform !== "win32" && process.platform !== "darwin")(
+    "file_path with different letter case on a case-insensitive file system still matches",
+    () => {
+      const r = fixRepo();
+      expect(decision(edit(r.dir, join(r.dir, "SRC", "Sock.ts"), GUARD + "\n", "", "case"))).toBe("deny");
+    },
+  );
 
   it("file symlink inside the repo pointing at a fixed file: no crash (skipped where symlinks need admin)", () => {
     const r = fixRepo();

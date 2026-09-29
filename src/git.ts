@@ -59,7 +59,7 @@ export function runGit(args: string[], cwd: string, timeoutMs = 10_000): string 
 export interface RepoLocation {
   /** Top level of the work tree, in the same form `git rev-parse --show-toplevel` prints. */
   root: string;
-  /** Absolute git dir for this work tree (per-worktree dir for linked worktrees and submodules). */
+  /** Absolute git dir for this work tree (per-worktree dir for linked worktrees and submodules), resolved like root. */
   gitDir: string;
 }
 
@@ -115,6 +115,13 @@ function hasUnusualConfig(gitDir: string): boolean {
   return false;
 }
 
+const slashes = (p: string) => (process.platform === "win32" ? p.replace(/\\/g, "/") : p);
+
+/**
+ * A path the way git prints it: links resolved (junctions, symlinked dirs, /tmp on macOS), 8.3
+ * short names expanded on Windows, forward slashes on Windows. Only the native realpath expands
+ * short names; the JS one keeps them.
+ */
 function gitStylePath(p: string): string {
   let r = p;
   try {
@@ -122,7 +129,7 @@ function gitStylePath(p: string): string {
   } catch {
     // keep as is
   }
-  return process.platform === "win32" ? r.replace(/\\/g, "/") : r;
+  return slashes(r);
 }
 
 /**
@@ -145,7 +152,11 @@ export function findRepoInJs(cwd: string): RepoLocation | null {
     }
     if (gitDir) {
       if (hasUnusualConfig(gitDir)) throw new NeedGit("unusual config");
-      return { root: gitStylePath(dir), gitDir };
+      // Resolve both the way git does, so they match what git prints and each other. A plain .git
+      // dir sits under the resolved root, which saves a second realpath; a .git file (worktree,
+      // submodule) can point anywhere, so its target is resolved on its own.
+      const root = gitStylePath(dir);
+      return { root, gitDir: gitDir === dotGit ? slashes(join(root, ".git")) : gitStylePath(gitDir) };
     }
     const up = dirname(dir);
     if (up === dir) return null;
