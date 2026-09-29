@@ -1,35 +1,35 @@
 # Architecture
 
 Chesterton is a Claude Code plugin that stops the agent from quietly undoing past bug fixes.
-Full product plan: see `C:\Users\arsh9\dev\plugin-brainstorm\PLAN.md` (sections 4 to 6).
+This file describes how the pieces fit together, for anyone changing the code.
 
 ## The idea in one line
 
 Index what every fix commit added and removed. On each edit, flag it when the edit
 **deletes lines a fix added** (`removes-fix`) or **re-adds lines a fix removed** (`re-adds-removed`).
 
-## Hard rules
+## Ground rules
 
 - Node 18+, TypeScript, **zero runtime dependencies**. Only `node:` builtins. Bundled by esbuild into `dist/`.
 - The hook must **fail open**: any error, timeout, missing git, not-a-repo, missing index means exit 0 with no output. Never block the user because Chesterton broke.
 - No network, no model calls, no telemetry. Everything stays in `<git-dir>/chesterton/`.
 - Windows, macOS, Linux. Watch CRLF, backslash paths, spaces in paths. Always repo-relative forward-slash paths internally (`toPosix`).
-- Shared contracts live in `src/types.ts` and `src/normalize.ts`. Do not change them without saying so in your report.
+- Shared contracts live in `src/types.ts` and `src/normalize.ts`. Both halves of the code depend on them, so change them with care.
 - Every module gets vitest tests using `test/helpers/repo.ts` (real throwaway git repos).
 - Public text (README, messages Claude sees) in plain human voice. No em dashes.
 
-## Module ownership
+## Modules
 
-| Owner | Files | Job |
+| Area | Files | Job |
 |---|---|---|
-| scaffold | `src/types.ts`, `src/normalize.ts`, `src/git.ts` (`runGit`, `repoRoot`), `test/helpers/repo.ts`, `scripts/build.mjs` | Shared base |
-| **A: history engine** | `src/classify.ts`, `src/index-store.ts`, `src/index-builder.ts`, `src/blame.ts`, may ADD functions to `src/git.ts` | Find fix commits, build and store the index, blame |
-| **B: edit check** | `src/edit-diff.ts`, `src/analyze.ts`, `src/decide.ts`, `src/session.ts`, `src/hook.ts` | Turn a tool call into findings and a hook response |
-| **C: product shell** | `src/config.ts`, `src/cli.ts`, `src/why.ts`, `src/diff-change.ts`, `.claude-plugin/*`, `hooks/hooks.json`, `skills/`, `commands/`, `README.md`, `LICENSE`, `.github/workflows/ci.yml` | Config, CLI, plugin packaging, docs |
+| Shared | `src/types.ts`, `src/normalize.ts`, `src/git.ts`, `test/helpers/repo.ts`, `scripts/build.mjs` | Types, line normalization, git runner, test repos, bundling |
+| History | `src/classify.ts`, `src/index-store.ts`, `src/index-builder.ts`, `src/blame.ts` | Find fix commits, build and store the index, blame |
+| Edit check | `src/edit-diff.ts`, `src/analyze.ts`, `src/decide.ts`, `src/session.ts`, `src/hook.ts` | Turn a tool call into findings and a hook response |
+| Shell | `src/config.ts`, `src/cli.ts`, `src/why.ts`, `src/diff-change.ts`, `.claude-plugin/`, `hooks/hooks.json`, `skills/`, `commands/` | Config, CLI, plugin packaging |
 
-## Contracts between modules (implement exactly these signatures)
+## Module interfaces
 
-### A exports
+### History
 
 ```ts
 // src/classify.ts
@@ -58,7 +58,7 @@ export function blameRange(repoRoot: string, relPath: string, start: number, end
 //   Blames the working-tree file. Returns [] for untracked files. Uncommitted lines come back with sha "0000000...".
 ```
 
-### B exports
+### Edit check
 
 ```ts
 // src/edit-diff.ts
@@ -84,7 +84,7 @@ export function saveSession(repoRoot: string, s: SessionState): void;
 //   Reads hook JSON from stdin, dispatches on hook_event_name: SessionStart, PreToolUse, Stop.
 ```
 
-### C exports
+### Shell
 
 ```ts
 // src/config.ts
@@ -103,7 +103,7 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
 //   chesterton status
 ```
 
-## Hook behavior (B implements, C wires into hooks/hooks.json)
+## Hook behavior
 
 - **SessionStart** (`startup|resume|clear|compact`): if not a repo, exit 0. If the index is missing or stale, spawn `node <dist>/cli.js index --quiet` detached and unref'd so the session never waits. Print nothing, or a one-line `additionalContext` only if an index already exists ("Chesterton: N fix commits indexed").
 - **PreToolUse** matcher `Edit|Write|MultiEdit`: build EditChange(s), analyze, decide.
@@ -117,7 +117,7 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
   - If the index is missing: fall back to blame only (removes-fix via blame + classify the blamed commits on the fly), capped by the timeout.
 - **Stop**: sweep `git diff HEAD` for files edited this session (from the session log), analyze each as whole-file changes, and if there are strong findings that were never surfaced, return `hookSpecificOutput.additionalContext` with a short ledger. Never block the stop in v1.
 
-## Detection rules (A and B agree on these)
+## Detection rules
 
 - Fix classifier score (threshold `FIX_THRESHOLD = 3`):
   - +3 message matches `\b(fix(e[sd])?|bug|hotfix|regression|revert|race|deadlock|crash|leak|workaround|incident|cve-\d+|oncall|segfault|null ?pointer|npe|off.by.one)\b` (case-insensitive) or conventional `^fix(\(.+\))?!?:`
