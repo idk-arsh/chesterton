@@ -1,0 +1,31 @@
+{
+  "name": "chesterton",
+  "version": "0.1.0",
+  "description": "Stops Claude Code from quietly undoing past bug fixes. Checks every edit against your git history of fix commits.",
+  "license": "MIT",
+  "author": "Arsh Singh",
+  "type": "module",
+  "bin": {
+    "chesterton": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}
