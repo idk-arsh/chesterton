@@ -43,6 +43,8 @@ export interface HookDeps {
   cliPath?: string;
   /** Override the budget start (ms since epoch). */
   startedAt?: number;
+  /** Working tree blame used by the edit check. Defaults to blameRange. For tests. */
+  blame?: BlameFn;
 }
 
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
@@ -104,7 +106,7 @@ export function handleHookInput(raw: string, deps: HookDeps = {}): string | null
 
     if (event === "PreToolUse") {
       const deadline = new Deadline(startedAt + cfg.hookTimeoutMs);
-      return preToolUse(root, cfg, sessionId, input, deadline);
+      return preToolUse(root, cfg, sessionId, input, deadline, deps.blame ?? blameRange);
     }
     if (event === "SessionStart") {
       return sessionStart(root, sessionId, deps);
@@ -215,7 +217,7 @@ function snapshotDirty(root: string, sessionId: string): void {
   try {
     if (loadBaseline(root, sessionId)) return;
     const dirty = dirtyFiles(root, 3_000);
-    const files: Record<string, string | null> = {};
+    const files: Record<string, string | null> = Object.create(null);
     let hashed = 0;
     for (const f of dirty.slice(0, MAX_BASELINE_FILES)) {
       files[f] = hashed++ < MAX_BASELINE_HASHED ? contentHash(root, f) : null;
@@ -234,6 +236,7 @@ function preToolUse(
   sessionId: string,
   input: Record<string, unknown>,
   deadline: Deadline,
+  blameFn: BlameFn,
 ): string | null {
   const tool = typeof input.tool_name === "string" ? input.tool_name : "";
   if (!EDIT_TOOLS.has(tool)) return null;
@@ -252,9 +255,11 @@ function preToolUse(
       session.files.push(change.relPath);
       if (session.files.length > MAX_SESSION_FILES) session.files.splice(0, session.files.length - MAX_SESSION_FILES);
     }
+    // Each blame call gets what is left of the budget, not the budget as it stood before the
+    // first one, so several blame windows cannot add up to more than the hook is allowed.
     const findings = idx
-      ? analyzeChange(root, change, idx, cfg, { timeoutMs: deadline.budget() })
-      : fallbackFindings(root, change, cfg, deadline);
+      ? analyzeChange(root, change, idx, cfg, { blame: (r, p, s, e) => blameFn(r, p, s, e, deadline.budget()) })
+      : fallbackFindings(root, change, cfg, deadline, blameFn);
     deadline.check();
     const res = decidePreToolUse(findings, session, cfg, change.relPath);
     if (res.stdout && !out) out = res.stdout;
@@ -341,9 +346,9 @@ export function addedLinesInCommit(root: string, sha: string, path: string, time
  * No index yet: blame the removed lines, classify the blamed commits on the fly, and run the normal
  * analysis against that tiny index. Only removes-fix can be found this way.
  */
-function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfig, deadline: Deadline): Finding[] {
+function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfig, deadline: Deadline, blameFn: BlameFn): Finding[] {
   if (change.isNewFile || change.removed.length === 0) return [];
-  const blame = memoBlame(deadline);
+  const blame = memoBlame(deadline, blameFn);
   const empty: ChestertonIndex = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: {} };
   const removalOnly: EditChange = { ...change, added: [] };
   // First pass only collects blame.
@@ -376,7 +381,9 @@ function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfi
   }
   if (Object.keys(idx.commits).length === 0) return [];
   deadline.check();
-  return analyzeChange(root, removalOnly, idx, cfg, { blame: blame.fn, alwaysBlame: true });
+  // The full change this time: these records have no removed lines, so only removes-fix can come
+  // out, and the added lines tell it which removed lines the edit keeps (moved or re-indented).
+  return analyzeChange(root, change, idx, cfg, { blame: blame.fn, alwaysBlame: true });
 }
 
 function parseNumstat(text: string): CommitFileChange[] {

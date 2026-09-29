@@ -183,7 +183,8 @@ export function parseFileLine(args: string[]): { file: string; line: number } {
     lineText = args[1]!;
   } else {
     const a = args[0]!;
-    const m = /^(.*?):(\d+)(?::\d+)?$/.exec(a);
+    // "file:line" or "file line" in one argument (the slash command quotes it); the path may hold spaces.
+    const m = /^(.*?)(?::|\s+)(\d+)(?::\d+)?$/.exec(a);
     if (!m) throw new UsageError(`expected <file>:<line>, got "${a}"`);
     file = m[1]!;
     lineText = m[2]!;

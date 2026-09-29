@@ -155,13 +155,17 @@ function removesFix(
   deps: AnalyzeDeps,
   fileLineCount: number,
 ): Hit[] {
+  // A removed line that the same change adds back (moved, or only re-indented) is still in the
+  // file, so it can be a weak hit but never a strong one. Counted, so removing one of two copies
+  // still counts.
+  const survivors = survivingLines(removed, change.added);
   // A strong hit needs a removed line whose hash some fix added to this file. When no removed
   // line can match, skip the blame (the slow part) and give up the weak signals it would find.
   if (!deps.alwaysBlame) {
     if (records.length === 0) return [];
     const addedHashes = new Set<string>();
     for (const rec of records) for (const e of rec.added) addedHashes.add(e.hash);
-    if (!removed.some((r) => addedHashes.has(hashLine(r.norm)))) return [];
+    if (!removed.some((r) => !survivors.has(r.line) && addedHashes.has(hashLine(r.norm)))) return [];
   }
   const blame = deps.blame ?? blameRange;
   const maxLine = Math.max(fileLineCount, ...removed.map((r) => r.line));
@@ -200,7 +204,7 @@ function removesFix(
     const hash = hashLine(r.norm);
     if (bl && isFixSha(bl.sha)) {
       const recs = recordsBySha.get(bl.sha) ?? [];
-      const strong = recs.some((rec) => rec.added.some((e) => e.hash === hash));
+      const strong = !survivors.has(r.line) && recs.some((rec) => rec.added.some((e) => e.hash === hash));
       hits.push({ kind: "removes-fix", strength: strong ? "strong" : "weak", sha: bl.sha, lines: [r.text.trim()] });
       if (strong) continue;
     }
@@ -218,6 +222,24 @@ function removesFix(
     }
   }
   return hits;
+}
+
+/** Line numbers of removed lines whose normalized text the change also adds. */
+function survivingLines(removed: { line: number; norm: string }[], added: string[]): Set<number> {
+  const counts = new Map<string, number>();
+  for (const a of added) {
+    const n = normalizeLine(a);
+    if (!isTrivial(n)) counts.set(n, (counts.get(n) ?? 0) + 1);
+  }
+  const out = new Set<number>();
+  for (const r of removed) {
+    const left = counts.get(r.norm) ?? 0;
+    if (left > 0) {
+      counts.set(r.norm, left - 1);
+      out.add(r.line);
+    }
+  }
+  return out;
 }
 
 function readdsRemoved(change: EditChange, records: FileFixRecord[], currentLines: string[]): Hit[] {

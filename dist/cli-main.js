@@ -879,7 +879,7 @@ function loadIndex(repoRoot2) {
     const manifest = loadManifest(dir, meta);
     const commits = manifest && loadCommits(dir, meta);
     if (!manifest || !commits) return null;
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const [path, name] of Object.entries(manifest.files)) {
       const shard = loadShard(dir, name, path);
       if (!shard) return null;
@@ -898,10 +898,10 @@ function loadIndexForFiles(repoRoot2, relPaths, opts = {}) {
     const manifest = loadManifest(dir, meta);
     if (!manifest) return null;
     const commits = {};
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const p of relPaths) {
       const key = normKey(p);
-      if (files[key]) continue;
+      if (Object.prototype.hasOwnProperty.call(files, key)) continue;
       const name = Object.prototype.hasOwnProperty.call(manifest.files, key) ? manifest.files[key] : void 0;
       if (!name) continue;
       const shard = loadShard(dir, name, key);
@@ -954,7 +954,7 @@ function saveIndex(repoRoot2, idx) {
   const shardDir = join3(dir, SHARD_DIR);
   mkdirSync(shardDir, { recursive: true });
   const id = `${Date.now().toString(36)}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const manifest = { version: INDEX_VERSION, id, files: {} };
+  const manifest = { version: INDEX_VERSION, id, files: /* @__PURE__ */ Object.create(null) };
   for (const [path, records] of Object.entries(idx.files)) {
     const commits = {};
     for (const r of records) {
@@ -1395,7 +1395,7 @@ function buildIndexDetailed(repoRoot2, cfg, opts = {}) {
     touchLock(lock);
     const forward = /* @__PURE__ */ new Map();
     const resolvePath = (p) => forward.has(p) ? forward.get(p) : p;
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     const add = (key, rec) => {
       (files[key] ??= []).push(rec);
     };
@@ -1560,11 +1560,12 @@ function analyzeChange(repoRoot2, change, idx, cfg, deps = {}) {
   return findings;
 }
 function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLineCount) {
+  const survivors = survivingLines(removed, change.added);
   if (!deps.alwaysBlame) {
     if (records.length === 0) return [];
     const addedHashes = /* @__PURE__ */ new Set();
     for (const rec of records) for (const e of rec.added) addedHashes.add(e.hash);
-    if (!removed.some((r) => addedHashes.has(hashLine(r.norm)))) return [];
+    if (!removed.some((r) => !survivors.has(r.line) && addedHashes.has(hashLine(r.norm)))) return [];
   }
   const blame = deps.blame ?? blameRange;
   const maxLine = Math.max(fileLineCount, ...removed.map((r) => r.line));
@@ -1600,7 +1601,7 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     const hash = hashLine(r.norm);
     if (bl && isFixSha(bl.sha)) {
       const recs = recordsBySha.get(bl.sha) ?? [];
-      const strong = recs.some((rec) => rec.added.some((e) => e.hash === hash));
+      const strong = !survivors.has(r.line) && recs.some((rec) => rec.added.some((e) => e.hash === hash));
       hits.push({ kind: "removes-fix", strength: strong ? "strong" : "weak", sha: bl.sha, lines: [r.text.trim()] });
       if (strong) continue;
     }
@@ -1617,6 +1618,22 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     }
   }
   return hits;
+}
+function survivingLines(removed, added) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const a of added) {
+    const n = normalizeLine(a);
+    if (!isTrivial(n)) counts.set(n, (counts.get(n) ?? 0) + 1);
+  }
+  const out = /* @__PURE__ */ new Set();
+  for (const r of removed) {
+    const left = counts.get(r.norm) ?? 0;
+    if (left > 0) {
+      counts.set(r.norm, left - 1);
+      out.add(r.line);
+    }
+  }
+  return out;
 }
 function readdsRemoved(change, records, currentLines) {
   const present = /* @__PURE__ */ new Set();
@@ -1932,7 +1949,7 @@ function explainLine(repoRoot2, relPath, line, idx) {
   const norm = normalizeLine(text);
   if (idx && !isTrivial(norm)) {
     const h = hashLine(norm);
-    const adders = (idx.files[path] ?? []).filter((r) => r.added.some((a) => a.hash === h)).map((r) => idx.commits[r.sha]).filter((c) => c !== void 0 && !fixes.some((f) => f.sha === c.sha));
+    const adders = recordsForFile(idx, path).filter((r) => r.added.some((a) => a.hash === h)).map((r) => idx.commits[r.sha]).filter((c) => c !== void 0 && !fixes.some((f) => f.sha === c.sha));
     if (adders.length > 0) {
       out.push("Fix commits that added this exact line:");
       for (const c of adders) {
@@ -2143,7 +2160,7 @@ function parseFileLine(args) {
     lineText = args[1];
   } else {
     const a = args[0];
-    const m = /^(.*?):(\d+)(?::\d+)?$/.exec(a);
+    const m = /^(.*?)(?::|\s+)(\d+)(?::\d+)?$/.exec(a);
     if (!m) throw new UsageError(`expected <file>:<line>, got "${a}"`);
     file = m[1];
     lineText = m[2];

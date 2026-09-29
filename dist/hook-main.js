@@ -619,10 +619,10 @@ function loadIndexForFiles(repoRoot2, relPaths, opts = {}) {
     const manifest = loadManifest(dir, meta);
     if (!manifest) return null;
     const commits = {};
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const p of relPaths) {
       const key = normKey(p);
-      if (files[key]) continue;
+      if (Object.prototype.hasOwnProperty.call(files, key)) continue;
       const name = Object.prototype.hasOwnProperty.call(manifest.files, key) ? manifest.files[key] : void 0;
       if (!name) continue;
       const shard = loadShard(dir, name, key);
@@ -1342,11 +1342,12 @@ function analyzeChange(repoRoot2, change, idx, cfg, deps = {}) {
   return findings;
 }
 function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLineCount) {
+  const survivors = survivingLines(removed, change.added);
   if (!deps.alwaysBlame) {
     if (records.length === 0) return [];
     const addedHashes = /* @__PURE__ */ new Set();
     for (const rec of records) for (const e of rec.added) addedHashes.add(e.hash);
-    if (!removed.some((r) => addedHashes.has(hashLine(r.norm)))) return [];
+    if (!removed.some((r) => !survivors.has(r.line) && addedHashes.has(hashLine(r.norm)))) return [];
   }
   const blame = deps.blame ?? blameRange;
   const maxLine = Math.max(fileLineCount, ...removed.map((r) => r.line));
@@ -1382,7 +1383,7 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     const hash = hashLine(r.norm);
     if (bl && isFixSha(bl.sha)) {
       const recs = recordsBySha.get(bl.sha) ?? [];
-      const strong = recs.some((rec) => rec.added.some((e) => e.hash === hash));
+      const strong = !survivors.has(r.line) && recs.some((rec) => rec.added.some((e) => e.hash === hash));
       hits.push({ kind: "removes-fix", strength: strong ? "strong" : "weak", sha: bl.sha, lines: [r.text.trim()] });
       if (strong) continue;
     }
@@ -1399,6 +1400,22 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     }
   }
   return hits;
+}
+function survivingLines(removed, added) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const a of added) {
+    const n = normalizeLine(a);
+    if (!isTrivial(n)) counts.set(n, (counts.get(n) ?? 0) + 1);
+  }
+  const out = /* @__PURE__ */ new Set();
+  for (const r of removed) {
+    const left = counts.get(r.norm) ?? 0;
+    if (left > 0) {
+      counts.set(r.norm, left - 1);
+      out.add(r.line);
+    }
+  }
+  return out;
 }
 function readdsRemoved(change, records, currentLines) {
   const present = /* @__PURE__ */ new Set();
@@ -1744,7 +1761,7 @@ function loadBaseline(repoRoot2, sessionId) {
     const raw = JSON.parse(readFileSync7(baselinePath(repoRoot2, sessionId), "utf8"));
     if (!raw || typeof raw !== "object" || typeof raw.at !== "string" || typeof raw.complete !== "boolean") return null;
     if (!raw.files || typeof raw.files !== "object" || Array.isArray(raw.files)) return null;
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const [k, v] of Object.entries(raw.files)) {
       if (typeof v === "string" || v === null) files[k] = v;
     }
@@ -1826,7 +1843,7 @@ function handleHookInput(raw, deps = {}) {
     const sessionId = typeof input.session_id === "string" && input.session_id ? input.session_id : "default";
     if (event === "PreToolUse") {
       const deadline = new Deadline(startedAt + cfg.hookTimeoutMs);
-      return preToolUse(root, cfg, sessionId, input, deadline);
+      return preToolUse(root, cfg, sessionId, input, deadline, deps.blame ?? blameRange);
     }
     if (event === "SessionStart") {
       return sessionStart(root, sessionId, deps);
@@ -1914,7 +1931,7 @@ function snapshotDirty(root, sessionId) {
   try {
     if (loadBaseline(root, sessionId)) return;
     const dirty = dirtyFiles(root, 3e3);
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     let hashed = 0;
     for (const f of dirty.slice(0, MAX_BASELINE_FILES)) {
       files[f] = hashed++ < MAX_BASELINE_HASHED ? contentHash(root, f) : null;
@@ -1924,7 +1941,7 @@ function snapshotDirty(root, sessionId) {
     logError(root, err);
   }
 }
-function preToolUse(root, cfg, sessionId, input, deadline) {
+function preToolUse(root, cfg, sessionId, input, deadline, blameFn) {
   const tool = typeof input.tool_name === "string" ? input.tool_name : "";
   if (!EDIT_TOOLS.has(tool)) return null;
   const changes = changeFromToolCall(root, tool, input.tool_input);
@@ -1940,7 +1957,7 @@ function preToolUse(root, cfg, sessionId, input, deadline) {
       session.files.push(change.relPath);
       if (session.files.length > MAX_SESSION_FILES) session.files.splice(0, session.files.length - MAX_SESSION_FILES);
     }
-    const findings = idx ? analyzeChange(root, change, idx, cfg, { timeoutMs: deadline.budget() }) : fallbackFindings(root, change, cfg, deadline);
+    const findings = idx ? analyzeChange(root, change, idx, cfg, { blame: (r, p, s, e) => blameFn(r, p, s, e, deadline.budget()) }) : fallbackFindings(root, change, cfg, deadline, blameFn);
     deadline.check();
     const res = decidePreToolUse(findings, session, cfg, change.relPath);
     if (res.stdout && !out) out = res.stdout;
@@ -2014,9 +2031,9 @@ function addedLinesInCommit(root, sha, path, timeoutMs) {
   }
   return out;
 }
-function fallbackFindings(root, change, cfg, deadline) {
+function fallbackFindings(root, change, cfg, deadline, blameFn) {
   if (change.isNewFile || change.removed.length === 0) return [];
-  const blame = memoBlame(deadline);
+  const blame = memoBlame(deadline, blameFn);
   const empty = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: {} };
   const removalOnly = { ...change, added: [] };
   analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn, alwaysBlame: true });
@@ -2044,7 +2061,7 @@ function fallbackFindings(root, change, cfg, deadline) {
   }
   if (Object.keys(idx.commits).length === 0) return [];
   deadline.check();
-  return analyzeChange(root, removalOnly, idx, cfg, { blame: blame.fn, alwaysBlame: true });
+  return analyzeChange(root, change, idx, cfg, { blame: blame.fn, alwaysBlame: true });
 }
 function parseNumstat(text) {
   const out = [];

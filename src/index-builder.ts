@@ -518,7 +518,8 @@ export function buildIndexDetailed(
     // deletes from commits newer than itself, which is exactly what its records need.
     const forward = new Map<string, string | null>();
     const resolvePath = (p: string): string | null => (forward.has(p) ? forward.get(p)! : p);
-    const files: Record<string, FileFixRecord[]> = {};
+    // No prototype: a file named `constructor` or `__proto__` must be a key like any other.
+    const files: Record<string, FileFixRecord[]> = Object.create(null);
     const add = (key: string, rec: FileFixRecord) => {
       (files[key] ??= []).push(rec);
     };

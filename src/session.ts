@@ -151,7 +151,7 @@ export function loadBaseline(repoRoot: string, sessionId: string): DirtyBaseline
     const raw = JSON.parse(readFileSync(baselinePath(repoRoot, sessionId), "utf8")) as Record<string, unknown>;
     if (!raw || typeof raw !== "object" || typeof raw.at !== "string" || typeof raw.complete !== "boolean") return null;
     if (!raw.files || typeof raw.files !== "object" || Array.isArray(raw.files)) return null;
-    const files: Record<string, string | null> = {};
+    const files: Record<string, string | null> = Object.create(null);
     for (const [k, v] of Object.entries(raw.files as Record<string, unknown>)) {
       if (typeof v === "string" || v === null) files[k] = v;
     }
