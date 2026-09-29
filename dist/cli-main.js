@@ -9,8 +9,31 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 var GitError = class extends Error {
 };
+var resolved = null;
+function gitExecutable() {
+  if (process.platform !== "win32") return "git";
+  const path = process.env.PATH ?? "";
+  if (resolved && resolved.path === path) return resolved.git;
+  let git = null;
+  for (const raw of path.split(";")) {
+    const dir = raw.trim().replace(/^"(.*)"$/, "$1");
+    if (!dir || !isAbsolute(dir)) continue;
+    const hit = [".exe", ".com"].map((ext) => join(dir, `git${ext}`)).find(isFile);
+    if (hit) {
+      git = hit;
+      break;
+    }
+  }
+  resolved = { path, git };
+  return git;
+}
+function gitOrThrow() {
+  const git = gitExecutable();
+  if (!git) throw new GitError("git was not found on PATH");
+  return git;
+}
 function runGit(args, cwd, timeoutMs = 1e4) {
-  const res = spawnSync("git", ["-c", "core.quotepath=off", ...args], {
+  const res = spawnSync(gitOrThrow(), ["-c", "core.quotepath=off", ...args], {
     cwd,
     encoding: "utf8",
     timeout: timeoutMs,
@@ -115,7 +138,7 @@ function repoRoot(cwd) {
   return locateRepo(cwd)?.root ?? null;
 }
 function runGitWithInput(args, cwd, input, timeoutMs = 1e4) {
-  const res = spawnSync("git", ["-c", "core.quotepath=off", ...args], {
+  const res = spawnSync(gitOrThrow(), ["-c", "core.quotepath=off", ...args], {
     cwd,
     input,
     encoding: "utf8",
@@ -375,6 +398,35 @@ function asInt(v) {
   const n = Number(t);
   return Number.isSafeInteger(n) ? n : null;
 }
+function hasNestedRepeat(src) {
+  const stack = [false];
+  const repeatAt = (i) => {
+    const c = src[i];
+    if (c === "*" || c === "+") return true;
+    const m = c === "{" ? /^\{(\d+)(,(\d*))?\}/.exec(src.slice(i)) : null;
+    if (!m) return false;
+    const max = m[2] === void 0 ? Number(m[1]) : m[3] === "" ? Infinity : Number(m[3]);
+    return max > 1;
+  };
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === "\\") {
+      i++;
+    } else if (c === "[") {
+      for (i++; i < src.length && src[i] !== "]"; i++) if (src[i] === "\\") i++;
+    } else if (c === "(") {
+      stack.push(false);
+    } else if (c === ")") {
+      const inner = stack.length > 1 ? stack.pop() : false;
+      const repeated = repeatAt(i + 1);
+      if (inner && repeated) return true;
+      stack[stack.length - 1] = stack[stack.length - 1] || inner || repeated;
+    } else if (repeatAt(i)) {
+      stack[stack.length - 1] = true;
+    }
+  }
+  return false;
+}
 function parseConfig(text) {
   const { values, warnings } = parseYamlSubset(text);
   const cfg = {
@@ -424,10 +476,15 @@ function parseConfig(text) {
         for (const src of list) {
           try {
             new RegExp(src, "i");
-            cfg.fixPatternsExtra.push(src);
           } catch {
             warnings.push(`fix_patterns_extra: "${src}" is not a valid regex, skipped`);
+            continue;
           }
+          if (hasNestedRepeat(src)) {
+            warnings.push(`fix_patterns_extra: "${src}" repeats a group that already repeats, which can take forever to match, skipped`);
+            continue;
+          }
+          cfg.fixPatternsExtra.push(src);
         }
         break;
       }
@@ -1932,9 +1989,23 @@ function day(iso) {
   return iso ? iso.slice(0, 10) : "unknown date";
 }
 
+// src/watchdog.ts
+import { Worker } from "node:worker_threads";
+function armWatchdog(ms) {
+  try {
+    const code = 'const { workerData: d } = require("node:worker_threads");setTimeout(() => { try { process.kill(d.pid, "SIGKILL"); } catch {} }, d.ms);';
+    const w = new Worker(code, { eval: true, workerData: { pid: process.pid, ms } });
+    w.on("error", () => {
+    });
+    w.unref();
+  } catch {
+  }
+}
+
 // src/cli.ts
 var VERSION = "0.1.0";
 var DEFAULT_LOCK_WAIT_MS = 6e4;
+var INDEX_WATCHDOG_MS = 10 * 6e4;
 var LOCK_POLL_MS = 250;
 var HELP = `chesterton ${VERSION}
 Stops Claude from quietly undoing past bug fixes.
@@ -2044,6 +2115,7 @@ function cmdIndex(io, full, quiet) {
     return 2;
   }
   const started = Date.now();
+  io.watchdog?.(INDEX_WATCHDOG_MS);
   try {
     const cfg = loadConfig(root);
     const { index: idx, outcome } = buildIndexDetailed(root, cfg, { full });
@@ -2295,7 +2367,8 @@ function defaultIO() {
 `),
     err: (t) => process.stderr.write(t.endsWith("\n") ? t : `${t}
 `),
-    cwd: process.cwd()
+    cwd: process.cwd(),
+    watchdog: armWatchdog
   };
 }
 function isEntryPoint() {
@@ -2311,6 +2384,7 @@ if (isEntryPoint()) {
   process.exitCode = main(process.argv.slice(2));
 }
 export {
+  INDEX_WATCHDOG_MS,
   VERSION,
   formatFinding,
   main,

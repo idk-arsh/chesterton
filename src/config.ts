@@ -168,6 +168,43 @@ function asInt(v: YamlValue | undefined): number | null {
 }
 
 /**
+ * True when a regex source repeats a group that holds a repeat, like `(a+)+` or `(\w*\s)*`. Those
+ * can backtrack for ages on a message that almost matches, and `.chesterton.yml` comes from the
+ * repo, so a cloned repo must not be able to hang the hook or the indexer with one. A rough check:
+ * it looks at `*`, `+` and `{n,}` style repeats and ignores `?`, escapes and character classes.
+ */
+export function hasNestedRepeat(src: string): boolean {
+  const stack: boolean[] = [false];
+  const repeatAt = (i: number) => {
+    const c = src[i];
+    if (c === "*" || c === "+") return true;
+    const m = c === "{" ? /^\{(\d+)(,(\d*))?\}/.exec(src.slice(i)) : null;
+    if (!m) return false;
+    // {3}, {2,}, {1,5} repeat; {0}, {1}, {0,1} do not.
+    const max = m[2] === undefined ? Number(m[1]) : m[3] === "" ? Infinity : Number(m[3]);
+    return max > 1;
+  };
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === "\\") {
+      i++;
+    } else if (c === "[") {
+      for (i++; i < src.length && src[i] !== "]"; i++) if (src[i] === "\\") i++;
+    } else if (c === "(") {
+      stack.push(false);
+    } else if (c === ")") {
+      const inner = stack.length > 1 ? stack.pop()! : false;
+      const repeated = repeatAt(i + 1);
+      if (inner && repeated) return true;
+      stack[stack.length - 1] = stack[stack.length - 1]! || inner || repeated;
+    } else if (repeatAt(i)) {
+      stack[stack.length - 1] = true;
+    }
+  }
+  return false;
+}
+
+/**
  * Turn the text of `.chesterton.yml` into a config. Bad values fall back to their defaults and
  * produce a warning. Unknown keys produce a warning and are ignored.
  */
@@ -221,10 +258,15 @@ export function parseConfig(text: string): { config: ChestertonConfig; warnings:
         for (const src of list) {
           try {
             new RegExp(src, "i");
-            cfg.fixPatternsExtra.push(src);
           } catch {
             warnings.push(`fix_patterns_extra: "${src}" is not a valid regex, skipped`);
+            continue;
           }
+          if (hasNestedRepeat(src)) {
+            warnings.push(`fix_patterns_extra: "${src}" repeats a group that already repeats, which can take forever to match, skipped`);
+            continue;
+          }
+          cfg.fixPatternsExtra.push(src);
         }
         break;
       }

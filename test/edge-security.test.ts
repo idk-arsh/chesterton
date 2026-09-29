@@ -34,7 +34,9 @@ describe("static review", () => {
   it("only node:fs, path, url, crypto, child_process, os and module are imported by the bundles", () => {
     for (const [name, text] of bundles) {
       const mods = new Set([...text.matchAll(/from\s+"(node:[a-z_/]+|[a-z_/]+)"/g)].map((m) => m[1]));
-      for (const m of mods) expect({ name, m }).toEqual({ name, m: expect.stringMatching(/^node:(fs|path|url|crypto|child_process|os|module)$/) });
+      // The CLI also starts a watchdog thread for `index`; the hook never does.
+      const allowed = name === "cli-main.js" ? /^node:(fs|path|url|crypto|child_process|os|module|worker_threads)$/ : /^node:(fs|path|url|crypto|child_process|os|module)$/;
+      for (const m of mods) expect({ name, m }).toEqual({ name, m: expect.stringMatching(allowed) });
     }
   });
 

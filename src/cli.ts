@@ -12,6 +12,7 @@ import { blameAt, gitDiffChanges } from "./diff-change.js";
 import { explainLine } from "./why.js";
 import { capList } from "./decide.js";
 import type { ChestertonIndex, Finding } from "./types.js";
+import { armWatchdog } from "./watchdog.js";
 
 export const VERSION = "0.1.0";
 
@@ -21,9 +22,16 @@ export interface CliIO {
   cwd: string;
   /** How long `check` waits for another index build to finish. Defaults to CHESTERTON_LOCK_WAIT_MS or 60 s. */
   lockWaitMs?: number;
+  /** Hard limit on the whole process, armed by `index`. The real CLI kills itself; tests leave it out. */
+  watchdog?: (ms: number) => void;
 }
 
 const DEFAULT_LOCK_WAIT_MS = 60_000;
+/**
+ * `index` gives up for good after this long. Its git calls share a 5 minute budget, so only a
+ * stuck process gets here, for example one caught in a runaway regex from the repo's config.
+ */
+export const INDEX_WATCHDOG_MS = 10 * 60_000;
 const LOCK_POLL_MS = 250;
 
 const HELP = `chesterton ${VERSION}
@@ -145,6 +153,7 @@ function cmdIndex(io: CliIO, full: boolean, quiet: boolean): number {
     return 2;
   }
   const started = Date.now();
+  io.watchdog?.(INDEX_WATCHDOG_MS);
   try {
     const cfg = loadConfig(root);
     const { index: idx, outcome } = buildIndexDetailed(root, cfg, { full });
@@ -428,6 +437,7 @@ function defaultIO(): CliIO {
     out: (t) => process.stdout.write(t.endsWith("\n") ? t : `${t}\n`),
     err: (t) => process.stderr.write(t.endsWith("\n") ? t : `${t}\n`),
     cwd: process.cwd(),
+    watchdog: armWatchdog,
   };
 }
 
