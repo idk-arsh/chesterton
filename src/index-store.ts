@@ -31,18 +31,55 @@ export function indexDir(repoRoot: string): string {
   return dir;
 }
 
-function isValidIndex(x: unknown): x is ChestertonIndex {
-  if (!x || typeof x !== "object") return false;
-  const o = x as Record<string, unknown>;
+const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === "object" && !Array.isArray(x);
+const isStrArr = (x: unknown): boolean => Array.isArray(x) && x.every((v) => typeof v === "string");
+
+function isValidEntries(x: unknown): boolean {
+  if (!Array.isArray(x)) return false;
+  for (const e of x) {
+    if (!isObj(e) || typeof e.hash !== "string" || typeof e.text !== "string" || typeof e.line !== "number") return false;
+  }
+  return true;
+}
+
+function isValidCommit(x: unknown): boolean {
   return (
-    o.version === INDEX_VERSION &&
-    typeof o.head === "string" &&
-    typeof o.builtAt === "string" &&
-    !!o.commits &&
-    typeof o.commits === "object" &&
-    !!o.files &&
-    typeof o.files === "object"
+    isObj(x) &&
+    typeof x.sha === "string" &&
+    typeof x.date === "string" &&
+    typeof x.author === "string" &&
+    typeof x.subject === "string" &&
+    typeof x.score === "number" &&
+    isStrArr(x.reasons) &&
+    isStrArr(x.refs) &&
+    isStrArr(x.testFiles)
   );
+}
+
+function isValidRecord(x: unknown): boolean {
+  return (
+    isObj(x) &&
+    typeof x.sha === "string" &&
+    typeof x.path === "string" &&
+    (x.oldPath === undefined || typeof x.oldPath === "string") &&
+    isValidEntries(x.added) &&
+    isValidEntries(x.removed)
+  );
+}
+
+/**
+ * Checks the whole shape, records included: one malformed record would otherwise make every
+ * incremental build throw, and the index would never update again.
+ */
+function isValidIndex(x: unknown): x is ChestertonIndex {
+  if (!isObj(x)) return false;
+  if (x.version !== INDEX_VERSION || typeof x.head !== "string" || typeof x.builtAt !== "string") return false;
+  if (!isObj(x.commits) || !isObj(x.files)) return false;
+  for (const c of Object.values(x.commits)) if (!isValidCommit(c)) return false;
+  for (const recs of Object.values(x.files)) {
+    if (!Array.isArray(recs) || !recs.every(isValidRecord)) return false;
+  }
+  return true;
 }
 
 /** The saved index, or null when it is missing, unreadable, corrupt, or from another version. Never throws. */

@@ -1,5 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { indexDir } from "./index-store.js";
 
 export interface SessionFinding {
@@ -21,40 +23,104 @@ export interface SessionState {
   files: string[];
 }
 
-/** Session ids come from Claude Code, but keep the filename safe on every OS anyway. */
+const SAFE_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,119}$/;
+const HASHED_TAIL = /\.h[0-9a-f]{12}$/;
+
+/**
+ * Session ids come from Claude Code, but keep the filename safe on every OS anyway.
+ * Injective: an id that is already a safe filename is used as is; anything else becomes a
+ * sanitized prefix plus a short hash of the raw id, so "a/b" and "a_b" never share a file.
+ */
 export function sanitizeSessionId(id: string): string {
-  const s = String(id ?? "").replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 120);
-  return s || "default";
+  const raw = String(id ?? "");
+  if (raw === "") return "default";
+  if (SAFE_ID.test(raw) && !HASHED_TAIL.test(raw)) return raw;
+  const prefix = raw.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 100);
+  const hash = createHash("sha1").update(raw, "utf8").digest("hex").slice(0, 12);
+  return `${prefix}.h${hash}`;
 }
 
 export function sessionPath(repoRoot: string, sessionId: string): string {
   return join(indexDir(repoRoot), "sessions", `${sanitizeSessionId(sessionId)}.json`);
 }
 
+/**
+ * Where a session goes when <git-dir>/chesterton cannot be written (read-only, or not a directory).
+ * Keyed by the repo root so two repos never mix.
+ */
+export function fallbackSessionPath(repoRoot: string, sessionId: string): string {
+  const key = createHash("sha1").update(resolve(repoRoot), "utf8").digest("hex").slice(0, 16);
+  return join(tmpdir(), "chesterton-sessions", key, `${sanitizeSessionId(sessionId)}.json`);
+}
+
 function strings(x: unknown): string[] {
   return Array.isArray(x) ? x.filter((v): v is string => typeof v === "string") : [];
 }
 
-/** Load a session. Missing or corrupt state gives a fresh empty session. */
-export function loadSession(repoRoot: string, sessionId: string): SessionState {
-  const fresh: SessionState = { sessionId, acknowledged: [], findings: [], files: [] };
+function readSessionFile(file: string): Omit<SessionState, "sessionId"> | null {
   try {
-    const raw = JSON.parse(readFileSync(sessionPath(repoRoot, sessionId), "utf8")) as Record<string, unknown>;
-    if (!raw || typeof raw !== "object") return fresh;
+    const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object") return null;
     const findings = Array.isArray(raw.findings)
       ? (raw.findings.filter((f) => f && typeof f === "object" && typeof (f as SessionFinding).key === "string") as SessionFinding[])
       : [];
-    return { sessionId, acknowledged: strings(raw.acknowledged), findings, files: strings(raw.files) };
+    return { acknowledged: strings(raw.acknowledged), findings, files: strings(raw.files) };
   } catch {
-    return fresh;
+    return null;
   }
 }
 
-/** Save a session atomically (tmp file + rename). */
-export function saveSession(repoRoot: string, s: SessionState): void {
-  const file = sessionPath(repoRoot, s.sessionId);
+/**
+ * Load a session. Missing or corrupt state gives a fresh empty session. State saved to the
+ * fallback location (when the git dir was not writable) is merged in.
+ */
+export function loadSession(repoRoot: string, sessionId: string): SessionState {
+  const s: SessionState = { sessionId, acknowledged: [], findings: [], files: [] };
+  const parts: (Omit<SessionState, "sessionId"> | null)[] = [];
+  try {
+    parts.push(readSessionFile(sessionPath(repoRoot, sessionId)));
+  } catch {
+    // indexDir failed: only the fallback can hold anything.
+  }
+  parts.push(readSessionFile(fallbackSessionPath(repoRoot, sessionId)));
+  for (const p of parts) {
+    if (!p) continue;
+    for (const a of p.acknowledged) if (!s.acknowledged.includes(a)) s.acknowledged.push(a);
+    for (const f of p.files) if (!s.files.includes(f)) s.files.push(f);
+    for (const f of p.findings) {
+      if (!s.findings.some((g) => g.at === f.at && g.key === f.key && g.decision === f.decision)) s.findings.push(f);
+    }
+  }
+  return s;
+}
+
+function writeAtomic(file: string, text: string): void {
   mkdirSync(join(file, ".."), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(s));
-  renameSync(tmp, file);
+  try {
+    writeFileSync(tmp, text);
+    renameSync(tmp, file);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+}
+
+/**
+ * Save a session atomically (tmp file + rename). When <git-dir>/chesterton cannot be written, falls
+ * back to a per-repo folder in the OS temp dir. Throws only when neither place can be written.
+ */
+export function saveSession(repoRoot: string, s: SessionState): void {
+  const text = JSON.stringify(s);
+  try {
+    writeAtomic(sessionPath(repoRoot, s.sessionId), text);
+    return;
+  } catch {
+    // fall through to the fallback location
+  }
+  writeAtomic(fallbackSessionPath(repoRoot, s.sessionId), text);
 }

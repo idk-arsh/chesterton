@@ -22,5 +22,5 @@ fix_patterns_extra: ["SEV\d", "postmortem"]
 # Commits that should never count as fixes (full shas or prefixes).
 ignore_commits: []
 
-# Time budget for the edit check, in milliseconds. Past it, the edit is allowed.
+# Time budget for the edit check, in milliseconds (100 to 4000). Past it, the edit is allowed.
 hook_timeout_ms: 1500

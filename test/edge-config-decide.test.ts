@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { handleHookInput } from "../src/hook.js";
 import { buildIndex } from "../src/index-builder.js";
-import { DEFAULT_CONFIG, loadConfig, loadConfigWithWarnings, parseConfig } from "../src/config.js";
+import { DEFAULT_CONFIG, MAX_HOOK_TIMEOUT_MS, loadConfig, loadConfigWithWarnings, parseConfig } from "../src/config.js";
 import { matchGlob } from "../src/decide.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
 
@@ -114,11 +114,14 @@ describe("config parsing edge cases", () => {
     expect(parseConfig("mode: Warn-Only\n").config.mode).toBe("warn-only");
   });
 
-  it("hook_timeout_ms: 100 and 60000 accepted, 99 / 60001 / junk rejected", () => {
+  it("hook_timeout_ms: 100 and 4000 accepted, larger capped at 4000 with a warning, 99 / junk rejected", () => {
     expect(parseConfig("hook_timeout_ms: 100").config.hookTimeoutMs).toBe(100);
-    expect(parseConfig("hook_timeout_ms: 60000").config.hookTimeoutMs).toBe(60000);
-    expect(parseConfig("hook_timeout_ms: 60_000").config.hookTimeoutMs).toBe(60000);
-    for (const v of ["99", "60001", "-5", "1.5e3", "abc", "", "0x100"]) {
+    expect(parseConfig("hook_timeout_ms: 4000").config.hookTimeoutMs).toBe(4000);
+    expect(parseConfig("hook_timeout_ms: 4_000").config.hookTimeoutMs).toBe(4000);
+    const capped = parseConfig("hook_timeout_ms: 60000");
+    expect(capped.config.hookTimeoutMs).toBe(MAX_HOOK_TIMEOUT_MS);
+    expect(capped.warnings.some((w) => w.includes("capped"))).toBe(true);
+    for (const v of ["99", "-5", "1.5e3", "abc", "", "0x100"]) {
       expect(parseConfig(`hook_timeout_ms: ${v}`).config.hookTimeoutMs).toBe(DEFAULT_CONFIG.hookTimeoutMs);
     }
   });
@@ -139,16 +142,16 @@ describe("config parsing edge cases", () => {
     expect(dec(edit(r, file, `${G1}\n`, "", "slow"))).toBe("deny");
   });
 
-  // BUG (cosmetic): hook_timeout_ms accepts up to 60000, but hooks/hooks.json gives the PreToolUse
-  // hook a 5 s timeout (and Stop, whose budget is 3x hook_timeout_ms, 15 s). Anything above about
-  // 4500 ms is cut off by Claude Code, which reports a hook error instead of Chesterton quietly
-  // allowing. Either cap hook_timeout_ms under the hooks.json timeout or raise the timeout.
-  it.fails("hooks.json timeouts cover the largest hook_timeout_ms the config accepts", () => {
+  // Was a bug: hook_timeout_ms accepted up to 60000 while hooks/hooks.json gives PreToolUse 5 s and
+  // Stop 15 s, so Claude Code cut the hook off and reported an error. The config now caps it.
+  it("hooks.json timeouts cover the largest hook_timeout_ms the config accepts", () => {
     const hooks = JSON.parse(readFileSync(join(ROOT, "hooks", "hooks.json"), "utf8"));
     const pre = hooks.hooks.PreToolUse[0].hooks[0].timeout * 1000;
     const stop = hooks.hooks.Stop[0].hooks[0].timeout * 1000;
-    expect(pre).toBeGreaterThan(60_000);
-    expect(stop).toBeGreaterThan(3 * 60_000);
+    // Room for Node startup and reading stdin on top of the budget.
+    expect(pre).toBeGreaterThanOrEqual(MAX_HOOK_TIMEOUT_MS + 1000);
+    expect(stop).toBeGreaterThanOrEqual(Math.max(3 * MAX_HOOK_TIMEOUT_MS, 3000) + 1000);
+    expect(parseConfig("hook_timeout_ms: 60000").config.hookTimeoutMs).toBeLessThanOrEqual(MAX_HOOK_TIMEOUT_MS);
   });
 
   it("status reports config warnings", () => {

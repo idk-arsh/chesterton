@@ -1,10 +1,11 @@
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { repoRoot as findRepoRoot, runGit } from "./git.js";
 import { toPosix } from "./normalize.js";
 import { loadConfig, loadConfigWithWarnings } from "./config.js";
-import { buildIndex, isIndexFresh } from "./index-builder.js";
+import { buildIndexDetailed, isIndexFresh, isLockHeld } from "./index-builder.js";
+import { splitLines } from "./normalize.js";
 import { indexDir, loadIndex } from "./index-store.js";
 import { analyzeChange } from "./analyze.js";
 import { blameAt, gitDiffChanges } from "./diff-change.js";
@@ -18,7 +19,12 @@ export interface CliIO {
   out(text: string): void;
   err(text: string): void;
   cwd: string;
+  /** How long `check` waits for another index build to finish. Defaults to CHESTERTON_LOCK_WAIT_MS or 60 s. */
+  lockWaitMs?: number;
 }
+
+const DEFAULT_LOCK_WAIT_MS = 60_000;
+const LOCK_POLL_MS = 250;
 
 const HELP = `chesterton ${VERSION}
 Stops Claude from quietly undoing past bug fixes.
@@ -35,7 +41,9 @@ Usage:
   chesterton --version
   chesterton help
 
-Exit codes: 0 ok, 1 strong findings from check (or index failed), 2 usage or setup error.`;
+Exit codes: 0 ok, 1 strong findings from check, a failed index, or a why line that does not exist,
+2 usage or setup error (check also exits 2 when another index build is still running after 60 s;
+set CHESTERTON_LOCK_WAIT_MS to change the wait).`;
 
 class UsageError extends Error {}
 
@@ -139,10 +147,11 @@ function cmdIndex(io: CliIO, full: boolean, quiet: boolean): number {
   const started = Date.now();
   try {
     const cfg = loadConfig(root);
-    const idx = buildIndex(root, cfg, { full });
+    const { index: idx, outcome } = buildIndexDetailed(root, cfg, { full });
     if (!quiet) {
       const secs = ((Date.now() - started) / 1000).toFixed(1);
-      if (!idx.head) io.out("No commits yet, nothing to index.");
+      if (outcome === "busy") io.out("Another index build is running. It will save the index when it finishes.");
+      else if (outcome === "no-commits") io.out("No commits yet, nothing to index.");
       else
         io.out(
           `Indexed ${plural(Object.keys(idx.commits).length, "fix commit")} across ${plural(Object.keys(idx.files).length, "file")} at ${idx.head.slice(0, 7)} in ${secs}s.`,
@@ -203,8 +212,89 @@ function cmdWhy(io: CliIO, args: string[]): number {
     io.err(`chesterton: ${file} is outside this repository (${root}).`);
     return 2;
   }
+  // A missing file, a directory, or a line past the end is an error, not an answer.
+  const problem = whyProblem(root, rel, line);
+  if (problem) {
+    io.err(`chesterton: ${problem}`);
+    return 1;
+  }
   io.out(explainLine(root, rel, line, loadIndex(root)));
   return 0;
+}
+
+function whyProblem(root: string, rel: string, line: number): string | null {
+  const full = resolve(root, rel);
+  let st;
+  try {
+    st = statSync(full);
+  } catch {
+    return `${rel}: file not found in the working tree.`;
+  }
+  if (st.isDirectory()) return `${rel} is a directory, not a file.`;
+  let count: number;
+  try {
+    count = splitLines(readFileSync(full, "utf8")).length;
+  } catch (e) {
+    return `${rel}: cannot read the file (${(e as Error).message}).`;
+  }
+  if (line > count) return `${rel}:${line}: no such line (the file has ${plural(count, "line")}).`;
+  return null;
+}
+
+function sleepMs(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      /* spin */
+    }
+  }
+}
+
+function lockWaitMs(io: CliIO): number {
+  if (typeof io.lockWaitMs === "number" && io.lockWaitMs >= 0) return io.lockWaitMs;
+  const env = Number(process.env.CHESTERTON_LOCK_WAIT_MS);
+  return Number.isFinite(env) && env >= 0 ? env : DEFAULT_LOCK_WAIT_MS;
+}
+
+/**
+ * An index at HEAD for `check`. When another build holds the lock, waits for it (polling) instead
+ * of checking against an empty or stale index, which would pass a change that removes a fix.
+ * Returns null, after printing why, when no fresh index can be had.
+ */
+function freshIndexForCheck(io: CliIO, root: string, cfg: ReturnType<typeof loadConfig>): ChestertonIndex | null {
+  let idx: ChestertonIndex | null = loadIndex(root);
+  if (isIndexFresh(root, idx)) return idx;
+  io.err(idx ? "chesterton: index is out of date, updating it first." : "chesterton: no index yet, building it first.");
+  const waitMs = lockWaitMs(io);
+  const until = Date.now() + waitMs;
+  let said = false;
+  for (;;) {
+    let res;
+    try {
+      res = buildIndexDetailed(root, cfg);
+    } catch (e) {
+      io.err(`chesterton: index failed: ${(e as Error).message}`);
+      return null;
+    }
+    if (res.outcome !== "busy") return res.index;
+    // Someone else is building. Their result may already be what we need.
+    idx = loadIndex(root);
+    if (isIndexFresh(root, idx)) return idx;
+    if (Date.now() >= until) break;
+    if (!said) {
+      io.err("chesterton: another index build is running, waiting for it to finish.");
+      said = true;
+    }
+    do sleepMs(Math.max(0, Math.min(LOCK_POLL_MS, until - Date.now())));
+    while (Date.now() < until && isLockHeld(root));
+  }
+  io.err(
+    `chesterton: another index build is still running after ${Math.round(waitMs / 1000)}s, so the diff was not checked. ` +
+      `Run check again when it finishes, or set CHESTERTON_LOCK_WAIT_MS to wait longer.`,
+  );
+  return null;
 }
 
 function cmdCheck(io: CliIO, range: { staged: boolean; base?: string }): number {
@@ -224,16 +314,7 @@ function cmdCheck(io: CliIO, range: { staged: boolean; base?: string }): number 
     return 0;
   }
 
-  let idx: ChestertonIndex | null = loadIndex(root);
-  if (!isIndexFresh(root, idx)) {
-    io.err(idx ? "chesterton: index is out of date, updating it first." : "chesterton: no index yet, building it first.");
-    try {
-      idx = buildIndex(root, cfg);
-    } catch (e) {
-      io.err(`chesterton: index failed: ${(e as Error).message}`);
-      return 2;
-    }
-  }
+  const idx = freshIndexForCheck(io, root, cfg);
   if (!idx) return 2;
 
   const head = headSha(root);

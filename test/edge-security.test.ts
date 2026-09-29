@@ -74,7 +74,7 @@ describe("hostile file names", () => {
     return r;
   }
 
-  for (const name of ["--output=pwned.txt", "-L1,1", "--exec=calc", "$(whoami).ts", "a;b&c d.ts", "`x`.ts", "%PATH%.ts"]) {
+  for (const name of ["--output=pwned.ts", "-L1,1", "--exec=calc", "$(whoami).ts", "a;b&c d.ts", "`x`.ts", "%PATH%.ts"]) {
     it(`file named ${JSON.stringify(name)}: detected, no option injection`, () => {
       const r = hostileRepo(name);
       const input = (sid: string) =>
@@ -92,7 +92,7 @@ describe("hostile file names", () => {
       handleHookInput(JSON.stringify({ cwd: r.dir, session_id: "h", hook_event_name: "Stop" }), deps());
       main(["why", "--", `${name}:2`], { ...quiet, cwd: r.dir });
       main(["check"], { ...quiet, cwd: r.dir });
-      expect(existsSync(join(r.dir, "pwned.txt"))).toBe(false);
+      expect(existsSync(join(r.dir, "pwned.ts"))).toBe(false);
       expect(existsSync(join(r.dir, "calc"))).toBe(false);
     });
   }

@@ -169,13 +169,24 @@ describe("branches and rewritten history", () => {
     expect(res.out.permissionDecisionReason).toContain(picked.slice(0, 7));
   });
 
-  it("revert of a fix: re-applying the original fix is flagged as re-adding what the revert removed", () => {
+  it("revert of a fix: a bare revert is not indexed as a fix", () => {
     const r = newRepo();
     const fix = withFix(r);
     r.git("revert", "--no-edit", fix);
     const rev = r.git("rev-parse", "HEAD").trim();
     const idx = buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });
-    // "Revert "fix: ..."" reads like a fix to the classifier.
+    // A plain `Revert "fix: ..."` only quotes a fix; it needs its own fix wording or a ref.
+    expect(idx.commits[rev]).toBeUndefined();
+  });
+
+  it("revert of a fix that gives its own reason: re-applying the original fix is flagged", () => {
+    const r = newRepo();
+    const fix = withFix(r);
+    r.git("revert", "--no-edit", fix);
+    const subject = r.git("log", "-1", "--format=%s").trim();
+    r.git("commit", "--amend", "-q", "-m", subject, "-m", "The fix caused a crash under load, see #99.");
+    const rev = r.git("rev-parse", "HEAD").trim();
+    const idx = buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });
     expect(idx.commits[rev]).toBeDefined();
     const res = hook(r, "Write", { file_path: join(r.dir, "src", "sock.ts"), content: text(FIXED) }, "rv");
     expect(res.decision).toBe("deny");
@@ -231,10 +242,10 @@ describe("fix commit shapes", () => {
     expect(res.out.permissionDecisionReason).toContain("修复");
   });
 
-  // BUG (wrong result, low): commit metadata is split on \x1e and \x1f. A message that contains either
+  // Was a bug (wrong result, low): commit metadata is split on \x1e and \x1f. A message that contains either
   // control character (pasted from a terminal or a tool) shifts the fields, so the commit is dropped or
   // its subject, author and body land in the wrong fields.
-  it.fails("a commit message containing \\x1e or \\x1f is still parsed correctly", () => {
+  it("a commit message containing \\x1e or \\x1f is still parsed correctly", () => {
     const r = newRepo();
     const fix = withFix(r, "src/sock.ts", "fix: race on close \x1f odd \x1e chars (#412)");
     const idx = buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });

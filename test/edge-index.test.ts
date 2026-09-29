@@ -11,6 +11,7 @@ import { handleHookInput } from "../src/hook.js";
 import { buildIndex } from "../src/index-builder.js";
 import { indexDir, loadIndex, INDEX_FILE } from "../src/index-store.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { INDEX_VERSION } from "../src/types.js";
 import { main, type CliIO } from "../src/cli.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
 
@@ -79,11 +80,11 @@ describe("corrupt and foreign index files", () => {
 
   it("index from an older or newer version number is ignored and rebuilt", () => {
     const { r } = fixRepo();
-    for (const version of [0, 2, "1"]) {
+    for (const version of [0, 1, 3, "2"]) {
       writeFileSync(indexFile(r), JSON.stringify({ version, head: "x", builtAt: "", commits: {}, files: {} }));
       expect(loadIndex(r.dir)).toBeNull();
       const idx = buildIndex(r.dir, { ...DEFAULT_CONFIG });
-      expect(idx.version).toBe(1);
+      expect(idx.version).toBe(INDEX_VERSION);
       expect(Object.keys(idx.commits)).toHaveLength(1);
     }
   });
@@ -110,10 +111,10 @@ describe("corrupt and foreign index files", () => {
     expect(() => removeGuard(r, "garbage")).not.toThrow();
   });
 
-  // BUG (blocks user, low likelihood): loadIndex only checks the top-level shape. A record list that is
+  // Was a bug (blocks user, low likelihood): loadIndex only checks the top-level shape. A record list that is
   // null (hand edit, disk damage, a buggy writer) makes every incremental build throw, so the index
   // never updates again until someone runs `index --full`, and the hook silently finds nothing.
-  it.fails("an index with a null record list is treated as corrupt and rebuilt", () => {
+  it("an index with a null record list is treated as corrupt and rebuilt", () => {
     const { r } = fixRepo();
     const idx = buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });
     writeFileSync(indexFile(r), JSON.stringify({ ...idx, files: { "src/sock.ts": null } }));
@@ -126,6 +127,20 @@ describe("corrupt and foreign index files", () => {
 });
 
 describe("lock file", () => {
+  it("old lock whose owner is still running is honored; past 30 minutes it is taken over", () => {
+    const { r } = fixRepo();
+    const lock = join(indexDir(r.dir), "index.lock");
+    writeFileSync(lock, JSON.stringify({ pid: process.ppid, at: "2020-01-01T00:00:00Z" }));
+    const old = new Date(Date.now() - 10 * 60_000);
+    utimesSync(lock, old, old);
+    expect(buildIndex(r.dir, { ...DEFAULT_CONFIG }).head).toBe("");
+    expect(existsSync(lock)).toBe(true);
+    const ancient = new Date(Date.now() - 40 * 60_000);
+    utimesSync(lock, ancient, ancient);
+    expect(Object.keys(buildIndex(r.dir, { ...DEFAULT_CONFIG }).commits)).toHaveLength(1);
+    expect(existsSync(lock)).toBe(false);
+  });
+
   it("stale lock (older than 5 minutes) is taken over", () => {
     const { r } = fixRepo();
     const lock = join(indexDir(r.dir), "index.lock");
@@ -148,26 +163,52 @@ describe("lock file", () => {
     expect(idx.head).toBe("");
   });
 
-  // BUG (cosmetic): with another build holding the lock, `chesterton index` says "No commits yet,
+  // Was a bug (cosmetic): with another build holding the lock, `chesterton index` says "No commits yet,
   // nothing to index." and exits 0, in a repo that has commits. It should say an index build is already
   // running.
-  it.fails("index with a fresh lock held by someone else says so", () => {
+  it("index with a fresh lock held by someone else says so", () => {
     const { r } = fixRepo();
     writeFileSync(join(indexDir(r.dir), "index.lock"), "{}");
     const res = cli(["index"], r.dir);
     expect(res.out + res.err).not.toContain("No commits yet");
   });
 
-  // BUG (wrong result): `chesterton check` builds the index when it is missing or stale, but when the
+  // Was a bug (wrong result): `chesterton check` builds the index when it is missing or stale, but when the
   // SessionStart background build holds the lock it gets an empty index back and reports
   // "No past fixes touched" with exit 0. A pre-commit hook or CI step then passes a change that removes a
   // fix. Repro: create .git/chesterton/index.lock, delete index.json, remove the guard line, run check.
-  it.fails("check while another build holds the lock does not pass a strong hit", () => {
+  it("check while another build holds the lock does not pass a strong hit", () => {
     const { r } = fixRepo();
     writeFileSync(join(indexDir(r.dir), "index.lock"), "{}");
     r.write("src/sock.ts", BASE);
+    const prev = process.env.CHESTERTON_LOCK_WAIT_MS;
+    process.env.CHESTERTON_LOCK_WAIT_MS = "600";
+    let res;
+    try {
+      res = cli(["check"], r.dir);
+    } finally {
+      if (prev === undefined) delete process.env.CHESTERTON_LOCK_WAIT_MS;
+      else process.env.CHESTERTON_LOCK_WAIT_MS = prev;
+    }
+    expect(res.code).toBe(2);
+    expect(res.err).toContain("another index build is still running");
+  });
+
+  it("check waits for another build to finish, then uses its index", async () => {
+    const { r } = fixRepo();
+    const lock = join(indexDir(r.dir), "index.lock");
+    writeFileSync(lock, "{}");
+    r.write("src/sock.ts", BASE);
+    // Release the lock from another process while check is waiting in this one.
+    const releaser = spawn(process.execPath, ["-e", `setTimeout(() => require("fs").unlinkSync(${JSON.stringify(lock)}), 800)`], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    const done = new Promise((resolve) => releaser.on("exit", resolve));
     const res = cli(["check"], r.dir);
-    expect(res.code).not.toBe(0);
+    await done;
+    expect(res.code).toBe(1);
+    expect(res.out).toContain("STRONG");
   });
 
   it("check without a lock catches the same change (control)", () => {
@@ -229,9 +270,9 @@ describe("unwritable index directory", () => {
     expect(handleHookInput(JSON.stringify({ cwd: r.dir, session_id: "b", hook_event_name: "Stop" }), deps())).toBeNull();
   });
 
-  // BUG (cosmetic): when the index directory cannot be created, `chesterton index` prints
+  // Was a bug (cosmetic): when the index directory cannot be created, `chesterton index` prints
   // "No commits yet, nothing to index." and exits 0. The help text says a failed index exits 1.
-  it.fails("index reports a failure when <git-dir>/chesterton cannot be created", () => {
+  it("index reports a failure when <git-dir>/chesterton cannot be created", () => {
     const { r } = fixRepo();
     const gitDir = join(r.dir, ".git");
     rmSync(join(gitDir, "chesterton"), { recursive: true, force: true });
@@ -261,11 +302,11 @@ describe("unwritable index directory", () => {
     expect(decision(removeGuard(r, "ro"))).toBe("deny");
   });
 
-  // BUG (blocks user): when the session file cannot be saved, the acknowledgement is lost, so the
+  // Was a bug (blocks user): when the session file cannot be saved, the acknowledgement is lost, so the
   // "retry the same edit and Chesterton will let it through" promise breaks. Every retry is denied
   // again and Claude is stuck on that edit. When the ack cannot be persisted the hook should fall back
   // to allowing with context (fail open) instead of denying.
-  it.fails("read-only index directory: the identical retry is allowed", () => {
+  it("read-only index directory: the identical retry is allowed", () => {
     const { r } = fixRepo();
     buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });
     if (!lockDown(r)) throw new Error("could not make the directory read-only");
@@ -273,10 +314,34 @@ describe("unwritable index directory", () => {
     expect(decision(removeGuard(r, "ro2"))).toBe("allow");
   });
 
-  // BUG (cosmetic): `chesterton index` in a read-only index directory prints
+  it("read-only index directory and no usable temp dir: allows with the explanation instead of denying", () => {
+    const { r } = fixRepo();
+    buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });
+    if (!lockDown(r)) throw new Error("could not make the directory read-only");
+    // Point the OS temp dir at a regular file so the fallback session folder cannot be made either.
+    const blocker = join(r.dir, "not-a-dir");
+    writeFileSync(blocker, "x");
+    const saved = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+    process.env.TEMP = process.env.TMP = process.env.TMPDIR = blocker;
+    let out: string | null;
+    try {
+      out = removeGuard(r, "ro3");
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    expect(decision(out)).toBe("allow");
+    const ctx = JSON.parse(out!).hookSpecificOutput.additionalContext as string;
+    expect(ctx).toContain("could not save");
+    expect(ctx).toContain("race on socket close");
+  });
+
+  // Was a bug (cosmetic): `chesterton index` in a read-only index directory prints
   // "No commits yet, nothing to index." and exits 0 (acquireLock gets EPERM and buildIndex treats that
   // like "someone else is building"). Help says a failed index exits 1.
-  it.fails("read-only index directory: index exits 1 with a message", () => {
+  it("read-only index directory: index exits 1 with a message", () => {
     const { r } = fixRepo();
     buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true });
     if (!lockDown(r)) throw new Error("could not make the directory read-only");

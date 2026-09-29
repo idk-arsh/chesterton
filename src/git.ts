@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 
 export class GitError extends Error {}
 
@@ -50,6 +52,26 @@ export function headSha(cwd: string, timeoutMs = 5_000): string | null {
     return out || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Shallow clone info. `boundary` holds the grafted commits listed in <git-dir>/shallow: git shows
+ * them without parents, so their diff claims every line of every file. Never throws.
+ */
+export function shallowInfo(cwd: string, timeoutMs = 5_000): { shallow: boolean; boundary: Set<string> } {
+  const boundary = new Set<string>();
+  try {
+    let p = runGit(["rev-parse", "--git-path", "shallow"], cwd, timeoutMs).trim();
+    if (!isAbsolute(p)) p = resolve(cwd, p);
+    if (!existsSync(p)) return { shallow: false, boundary };
+    for (const line of readFileSync(p, "utf8").split(/\r?\n/)) {
+      const sha = line.trim();
+      if (sha) boundary.add(sha);
+    }
+    return { shallow: boundary.size > 0, boundary };
+  } catch {
+    return { shallow: false, boundary };
   }
 }
 
