@@ -3,3 +3,4 @@ build-tsc/
 coverage/
 *.log
 .DS_Store
+.claude/
