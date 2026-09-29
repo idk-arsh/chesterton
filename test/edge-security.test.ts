@@ -29,12 +29,12 @@ const quiet: CliIO = { out: () => {}, err: () => {}, cwd: "" };
 describe("static review", () => {
   const srcFiles = readdirSync(join(ROOT, "src")).filter((f) => f.endsWith(".ts"));
   const src = srcFiles.map((f) => [f, readFileSync(join(ROOT, "src", f), "utf8")] as const);
-  const bundles = ["hook.js", "cli.js"].map((f) => [f, readFileSync(join(ROOT, "dist", f), "utf8")] as const);
+  const bundles = ["hook.js", "cli.js", "hook-main.js", "cli-main.js"].map((f) => [f, readFileSync(join(ROOT, "dist", f), "utf8")] as const);
 
-  it("only node:fs, path, url, crypto, child_process are imported by the bundles", () => {
+  it("only node:fs, path, url, crypto, child_process, os and module are imported by the bundles", () => {
     for (const [name, text] of bundles) {
       const mods = new Set([...text.matchAll(/from\s+"(node:[a-z_/]+|[a-z_/]+)"/g)].map((m) => m[1]));
-      for (const m of mods) expect({ name, m }).toEqual({ name, m: expect.stringMatching(/^node:(fs|path|url|crypto|child_process|os)$/) });
+      for (const m of mods) expect({ name, m }).toEqual({ name, m: expect.stringMatching(/^node:(fs|path|url|crypto|child_process|os|module)$/) });
     }
   });
 

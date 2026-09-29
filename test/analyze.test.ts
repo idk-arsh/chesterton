@@ -64,25 +64,60 @@ describe("analyzeChange: removes-fix", () => {
     expect(f[0]!.lines).toEqual([GUARD1.trim()]);
   });
 
-  it("weak when blame points at the fix but the hash is not in its added lines", () => {
+  it("weak when blame points at the fix but the hash is not in its added lines (when blame runs)", () => {
     const { r, fix } = fixRepo();
     const idx = index([fixCommit(fix)], {
       "src/sock.ts": [{ sha: fix, path: "src/sock.ts", added: [entry("something else entirely here", 9)], removed: [] }],
     });
     const [change] = changeFromToolCall(r.dir, "Edit", { file_path: "src/sock.ts", old_string: `${GUARD2}\n`, new_string: "" });
-    const f = analyzeChange(r.dir, change!, idx, cfg);
+    const f = analyzeChange(r.dir, change!, idx, cfg, { alwaysBlame: true });
     expect(f.map((x) => [x.kind, x.strength])).toEqual([["removes-fix", "weak"]]);
   });
 
-  it("weak when a removed line sits next to a line the fix added", () => {
+  it("weak when a removed line sits next to a line the fix added (when blame runs)", () => {
     const { r, fix } = fixRepo();
     const idx = index([fixCommit(fix)], {
       "src/sock.ts": [{ sha: fix, path: "src/sock.ts", added: [entry(GUARD1, 2), entry(GUARD2, 3)], removed: [] }],
     });
     // "sock.end();" came from the base commit, but it is right under the fix's lines.
     const [change] = changeFromToolCall(r.dir, "Edit", { file_path: "src/sock.ts", old_string: "  sock.end();\n", new_string: "" });
-    const f = analyzeChange(r.dir, change!, idx, cfg);
+    const f = analyzeChange(r.dir, change!, idx, cfg, { alwaysBlame: true });
     expect(f.map((x) => [x.kind, x.strength])).toEqual([["removes-fix", "weak"]]);
+  });
+
+  it("does not blame at all when no removed line matches a line a fix added to the file", () => {
+    const sha = "c".repeat(40);
+    let calls = 0;
+    const blame = (_r: string, _p: string, s: number, e: number): BlameLine[] => {
+      calls++;
+      return Array.from({ length: e - s + 1 }, (_, i) => ({ line: s + i, sha, origLine: s + i, origPath: "a.ts" }));
+    };
+    const text = ["x", "validateToken(token, now)", "unrelatedCall(someArgument)", "x"];
+    const idx = index([fixCommit(sha)], { "a.ts": [{ sha, path: "a.ts", added: [entry(text[1]!, 2)], removed: [] }] });
+    const change: EditChange = { relPath: "a.ts", removed: [{ line: 3, text: text[2]! }], added: [], isNewFile: false };
+    // Next to a fix line, so a blame would give a weak hit; the skip gives that up for speed.
+    expect(analyzeChange("/nowhere", change, idx, cfg, { blame, currentContent: text.join("\n") })).toEqual([]);
+    expect(calls).toBe(0);
+    // A file with no fix records at all is never blamed either.
+    const none: EditChange = { ...change, relPath: "b.ts" };
+    expect(analyzeChange("/nowhere", none, idx, cfg, { blame, currentContent: text.join("\n") })).toEqual([]);
+    expect(calls).toBe(0);
+    // Once one removed line matches, blame runs and the strong hit is found.
+    const hit: EditChange = { ...change, removed: [{ line: 2, text: text[1]! }, { line: 3, text: text[2]! }] };
+    const f = analyzeChange("/nowhere", hit, idx, cfg, { blame, currentContent: text.join("\n") });
+    expect(calls).toBe(1);
+    expect(f.map((x) => [x.kind, x.strength])).toEqual([["removes-fix", "strong"]]);
+  });
+
+  it("alwaysBlame blames even when nothing could match", () => {
+    let calls = 0;
+    const blame = (): BlameLine[] => {
+      calls++;
+      return [];
+    };
+    const change: EditChange = { relPath: "a.ts", removed: [{ line: 1, text: "doSomethingImportant()" }], added: [], isNewFile: false };
+    analyzeChange("/nowhere", change, index([], {}), cfg, { blame, alwaysBlame: true, currentContent: "doSomethingImportant()\n" });
+    expect(calls).toBe(1);
   });
 
   it("nothing when the blamed commit is not a fix", () => {

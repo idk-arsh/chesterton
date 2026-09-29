@@ -113,4 +113,4 @@ export interface ChestertonConfig {
 }
 
 export const FIX_THRESHOLD = 3;
-export const INDEX_VERSION = 2 as const;
+export const INDEX_VERSION = 3 as const;

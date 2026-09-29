@@ -22,6 +22,11 @@ export interface AnalyzeDeps {
   timeoutMs?: number;
   /** Current file content. Read from disk when omitted. */
   currentContent?: string | null;
+  /**
+   * Blame every removal, even when no strong hit is possible. The no-index fallback needs this:
+   * it learns which commits to classify from the blame itself.
+   */
+  alwaysBlame?: boolean;
 }
 
 const ZERO_SHA = /^0+$/;
@@ -150,6 +155,14 @@ function removesFix(
   deps: AnalyzeDeps,
   fileLineCount: number,
 ): Hit[] {
+  // A strong hit needs a removed line whose hash some fix added to this file. When no removed
+  // line can match, skip the blame (the slow part) and give up the weak signals it would find.
+  if (!deps.alwaysBlame) {
+    if (records.length === 0) return [];
+    const addedHashes = new Set<string>();
+    for (const rec of records) for (const e of rec.added) addedHashes.add(e.hash);
+    if (!removed.some((r) => addedHashes.has(hashLine(r.norm)))) return [];
+  }
   const blame = deps.blame ?? blameRange;
   const maxLine = Math.max(fileLineCount, ...removed.map((r) => r.line));
   const windows = mergeRanges(

@@ -7,10 +7,9 @@ import { fileURLToPath } from "node:url";
 import type { BlameLine, ChestertonConfig, ChestertonIndex, EditChange, Finding, FixCommit, LineEntry } from "./types.js";
 import { INDEX_VERSION } from "./types.js";
 import { hashLine, isTrivial, normalizeLine, splitLines } from "./normalize.js";
-import { repoRoot as findRepoRoot, runGit, shallowInfo } from "./git.js";
+import { headSha, repoRoot as findRepoRoot, runGit, shallowInfo } from "./git.js";
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
-import { indexDir, loadIndex } from "./index-store.js";
-import { isIndexFresh } from "./index-builder.js";
+import { indexDir, loadIndexForFiles, loadMeta } from "./index-store.js";
 import { blameRange, parsePorcelain } from "./blame.js";
 import { classifyCommit, type CommitFileChange } from "./classify.js";
 import { changeFromToolCall, diffLines, toolPathToNative } from "./edit-diff.js";
@@ -165,14 +164,11 @@ function samePath(a: string, b: string): boolean {
 // ---------- SessionStart ----------
 
 function sessionStart(root: string, deps: HookDeps): string | null {
-  const idx = loadIndex(root);
-  let fresh = false;
-  try {
-    fresh = idx !== null && isIndexFresh(root, idx);
-  } catch {
-    fresh = false;
-  }
-  if (!fresh) {
+  // Without a HEAD (git missing, or no commits yet) there is nothing to index or check.
+  const head = headSha(root);
+  if (!head) return null;
+  const meta = loadMeta(root);
+  if (!meta || meta.head !== head) {
     const spawnIt = deps.spawnIndexer ?? defaultSpawnIndexer(deps.cliPath ?? join(scriptDir(), "cli.js"));
     try {
       spawnIt(root);
@@ -180,8 +176,8 @@ function sessionStart(root: string, deps: HookDeps): string | null {
       logError(root, err);
     }
   }
-  if (!idx) return null;
-  const n = Object.keys(idx.commits).length;
+  if (!meta) return null;
+  const n = meta.fixCommits;
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: "SessionStart",
@@ -205,7 +201,7 @@ function preToolUse(
   if (changes.length === 0) return null;
   deadline.check();
 
-  const idx = loadIndex(root);
+  const idx = loadIndexForFiles(root, changes.map((c) => c.relPath));
   deadline.check();
   const session = loadSession(root, sessionId);
   const before = JSON.stringify(session);
@@ -303,7 +299,7 @@ function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfi
   const empty: ChestertonIndex = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: {} };
   const removalOnly: EditChange = { ...change, added: [] };
   // First pass only collects blame.
-  analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn });
+  analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn, alwaysBlame: true });
 
   const idx: ChestertonIndex = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
   let n = 0;
@@ -327,7 +323,7 @@ function fallbackFindings(root: string, change: EditChange, cfg: ChestertonConfi
   }
   if (Object.keys(idx.commits).length === 0) return [];
   deadline.check();
-  return analyzeChange(root, removalOnly, idx, cfg, { blame: blame.fn });
+  return analyzeChange(root, removalOnly, idx, cfg, { blame: blame.fn, alwaysBlame: true });
 }
 
 function parseNumstat(text: string): CommitFileChange[] {
@@ -360,13 +356,14 @@ function stop(
 ): { text: string; commit: () => void } | null {
   const session: SessionState = loadSession(root, sessionId);
   if (session.files.length === 0) return null;
-  const idx = loadIndex(root);
+  const files = session.files.slice(-MAX_STOP_FILES);
+  const idx = loadIndexForFiles(root, files);
   if (!idx) return null;
   const seen = new Set([...session.acknowledged, ...session.findings.map((f) => f.key)]);
   const ledger: Finding[] = [];
   const blame: BlameFn = (r, p, s, e) => blameAtHead(r, p, s, e, deadline.budget());
 
-  for (const rel of session.files.slice(-MAX_STOP_FILES)) {
+  for (const rel of files) {
     deadline.check();
     let headText: string | null = null;
     try {

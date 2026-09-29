@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -199,5 +199,43 @@ describe("bundled hook process", () => {
       expect(o.permissionDecision).toBe("deny");
       expect(o.permissionDecisionReason).toContain(fix.slice(0, 7));
     }
+  });
+});
+
+describe("speed paths", () => {
+  it("SessionStart reads only meta.json: the count shows even when the shards are gone", () => {
+    const { r } = fixRepo(true);
+    const dir = join(r.dir, ".git", "chesterton");
+    for (const f of readdirSync(dir)) if (/^(manifest|commits)-/.test(f)) rmSync(join(dir, f));
+    rmSync(join(dir, "shards"), { recursive: true, force: true });
+    let spawned = 0;
+    const res = out(handleHookInput(JSON.stringify({ session_id: "m", cwd: r.dir, hook_event_name: "SessionStart" }), { spawnIndexer: () => spawned++ }));
+    expect(res.additionalContext).toContain("1 fix commit indexed");
+    expect(spawned).toBe(0);
+  });
+
+  it("SessionStart with only a version 2 index.json: rebuilds instead of crashing", () => {
+    const { r } = fixRepo(false);
+    const dir = join(r.dir, ".git", "chesterton");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "index.json"), JSON.stringify({ version: 2, head: r.git("rev-parse", "HEAD").trim(), builtAt: "", commits: {}, files: {} }));
+    let spawned = 0;
+    expect(handleHookInput(JSON.stringify({ session_id: "v2", cwd: r.dir, hook_event_name: "SessionStart" }), { spawnIndexer: () => spawned++ })).toBeNull();
+    expect(spawned).toBe(1);
+  });
+
+  it("PreToolUse only needs the edited file's shard", () => {
+    const { r, fix } = fixRepo(true);
+    r.write("src/other.ts", "export const x = 1;\n");
+    r.commit("initial other");
+    r.write("src/other.ts", "export const x = 1;\nassertPositive(x);\n");
+    r.commit("fix: crash on negative x");
+    saveIndex(r.dir, buildIndex(r.dir, { ...DEFAULT_CONFIG }, { full: true }));
+    const dir = join(r.dir, ".git", "chesterton");
+    const manifest = JSON.parse(readFileSync(join(dir, readdirSync(dir).find((f) => f.startsWith("manifest-"))!), "utf8"));
+    writeFileSync(join(dir, "shards", `${manifest.files["src/other.ts"]}.json`), "{ damaged");
+    const res = out(handleHookInput(pre(r, { file_path: "src/sock.ts", old_string: `${GUARD1}\n`, new_string: "" }, "shard"), deps()));
+    expect(res.permissionDecision).toBe("deny");
+    expect(res.permissionDecisionReason).toContain(fix.slice(0, 7));
   });
 });
