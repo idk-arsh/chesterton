@@ -93,14 +93,21 @@ as HEAD moves.
 **The check.** On every Edit, Write or MultiEdit, the hook works out which lines the edit removes and
 adds, then looks for two things:
 
-1. **Removing a fix.** It blames the lines being removed. If the commit that last touched a line is
-   a fix commit, and that commit added that exact line, it's a strong hit.
+1. **Removing a fix.** If a removed line matches one a fix commit added to this file, it blames the
+   removed lines. If the commit that last touched a line is that fix, and it added that exact line,
+   it's a strong hit. A line the same edit puts back somewhere else doesn't count.
 2. **Putting back what a fix removed.** It hashes the lines being added and looks them up in what
    fix commits deleted from this file. Two or more matching lines in a row is a strong hit.
 
-Weaker matches (a line a fix only touched, a line right next to one a fix added, a single long line
-that a fix removed, removing lines from a test file) don't block anything. They get passed to
-Claude as a note. An edit that only re-wraps or re-indents code is ignored.
+Weaker matches (a line right next to one a fix added, a single long line that a fix removed,
+removing lines from a test file) don't block anything. They get passed to Claude as a note. Blame
+only runs when a strong hit is possible, so notes that only blame could find, like a line a fix
+merely touched, show up only alongside a strong hit. An edit that only re-wraps or re-indents code
+is ignored.
+
+Most edits don't touch a fix at all, and those never run blame. On clones of flask and cargo that
+check took about 20 to 30 ms on top of Node's own startup. An edit that does hit a fix runs blame
+and takes longer, around 170 ms extra on cargo.
 
 **When the session ends**, a Stop hook sweeps the files Claude changed against HEAD, so a fix taken
 apart across several small edits still shows up in a short summary. That includes files changed
@@ -110,6 +117,10 @@ session started and haven't changed since.
 **It fails open.** If git is missing, the folder isn't a repo, the index isn't built yet, or anything
 throws or runs past its time budget, the hook exits quietly and your edit goes through. Chesterton
 breaking should never block you. There's no network access, no telemetry, and no API key.
+
+**It treats the repo as untrusted.** Git runs from your PATH, never from the repo folder. Globs in
+`protect` are matched in linear time. A `fix_patterns_extra` pattern with a nested repeat, like
+`(a+)+`, is skipped with a warning, and index builds stop after 10 minutes.
 
 ## Config
 
