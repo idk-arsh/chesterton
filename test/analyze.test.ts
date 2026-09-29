@@ -4,6 +4,7 @@ import { changeFromToolCall } from "../src/edit-diff.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { hashLine, normalizeLine } from "../src/normalize.js";
 import type { BlameLine, ChestertonIndex, EditChange, FixCommit, LineEntry } from "../src/types.js";
+import { INDEX_VERSION } from "../src/types.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
 
 const cfg = { ...DEFAULT_CONFIG };
@@ -31,7 +32,7 @@ function fixCommit(sha: string, subject = "fix: race on socket close (#412)"): F
 }
 
 function index(commits: FixCommit[], files: ChestertonIndex["files"]): ChestertonIndex {
-  return { version: 1, head: "x", builtAt: "", commits: Object.fromEntries(commits.map((c) => [c.sha, c])), files };
+  return { version: INDEX_VERSION, head: "x", builtAt: "", commits: Object.fromEntries(commits.map((c) => [c.sha, c])), files };
 }
 
 const BASE = ["function close(sock) {", "  sock.end();", "  cleanup(sock);", "}", ""].join("\n");
@@ -228,5 +229,64 @@ describe("analyzeChange with the real index builder", () => {
     const f2 = analyzeChange(r.dir, c2!, idx2, cfg);
     // One re-added line, short, so it does not count. Nothing flagged.
     expect(f2.filter((x) => x.kind === "re-adds-removed" && x.strength === "strong")).toEqual([]);
+  });
+});
+
+describe("analyzeChange: noise filters", () => {
+  const sha = "c".repeat(40);
+  const LINE_A = "return retryWithBackoff(req)";
+  const LINE_B = "validateToken(token, now)";
+  const blameAll = (_r: string, p: string, s: number, e: number): BlameLine[] =>
+    Array.from({ length: e - s + 1 }, (_, i) => ({ line: s + i, sha, origLine: s + i, origPath: p }));
+  const idxFor = (path: string) =>
+    index([fixCommit(sha)], { [path]: [{ sha, path, added: [entry(LINE_A, 1), entry(LINE_B, 2)], removed: [entry("oldCall(a, b, c, d)", 1)] }] });
+  const removal = (relPath: string): EditChange => ({
+    relPath,
+    removed: [
+      { line: 1, text: LINE_A },
+      { line: 2, text: LINE_B },
+    ],
+    added: [],
+    isNewFile: false,
+  });
+
+  it("never checks docs, changelogs, CI config or lockfiles", () => {
+    for (const p of ["README.md", "History.md", "docs/api.rst", ".github/workflows/ci.yml", ".travis.yml", "package-lock.json"]) {
+      expect(analyzeChange("/nowhere", removal(p), idxFor(p), cfg, { blame: blameAll, currentContent: `${LINE_A}\n${LINE_B}\n` }), p).toEqual([]);
+    }
+    const code = analyzeChange("/nowhere", removal("src/a.ts"), idxFor("src/a.ts"), cfg, { blame: blameAll, currentContent: `${LINE_A}\n${LINE_B}\n` });
+    expect(code.map((f) => f.strength)).toEqual(["strong"]);
+  });
+
+  it("caps removals in test files at weak", () => {
+    const p = "tests/test_retry.py";
+    const f = analyzeChange("/nowhere", removal(p), idxFor(p), cfg, { blame: blameAll, currentContent: `${LINE_A}\n${LINE_B}\n` });
+    expect(f).toHaveLength(1);
+    expect(f[0]).toMatchObject({ kind: "removes-fix", strength: "weak" });
+  });
+
+  it("re-adding removed lines in a test file can still be strong", () => {
+    const p = "test/net.test.ts";
+    const OLD1 = "setTimeout(retry, 0); // spin until ready";
+    const OLD2 = "state.ready = true;";
+    const idx = index([fixCommit(sha)], { [p]: [{ sha, path: p, added: [], removed: [entry(OLD1, 1), entry(OLD2, 2)] }] });
+    const f = analyzeChange("/nowhere", { relPath: p, removed: [], added: [OLD1, OLD2], isNewFile: false }, idx, cfg, { blame: () => [], currentContent: "" });
+    expect(f.map((x) => [x.kind, x.strength])).toEqual([["re-adds-removed", "strong"]]);
+  });
+
+  it("produces nothing for a whitespace-only reflow", () => {
+    const change: EditChange = {
+      relPath: "src/a.ts",
+      removed: [
+        { line: 1, text: LINE_A },
+        { line: 2, text: LINE_B },
+      ],
+      added: ["return retryWithBackoff(", "  req", ")", "  validateToken(token,   now)"],
+      isNewFile: false,
+    };
+    expect(analyzeChange("/nowhere", change, idxFor("src/a.ts"), cfg, { blame: blameAll, currentContent: `${LINE_A}\n${LINE_B}\n` })).toEqual([]);
+    // Drop one of the lines for real and it counts again.
+    const real: EditChange = { ...change, added: ["return retryWithBackoff(", "  req", ")"] };
+    expect(analyzeChange("/nowhere", real, idxFor("src/a.ts"), cfg, { blame: blameAll, currentContent: `${LINE_A}\n${LINE_B}\n` })).not.toEqual([]);
   });
 });

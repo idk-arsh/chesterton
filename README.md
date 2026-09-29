@@ -60,20 +60,33 @@ That's it. The first session in a repo builds the index in the background. Nothi
 
 ## How it works
 
-**Finding fix commits.** Each commit gets a score from things you can see in git, no model involved:
+**Finding fix commits.** A commit only counts as a fix when its message says so: fix, bug,
+regression, race, crash, leak, workaround and so on, a conventional `fix:` prefix, or one of your
+`fix_patterns_extra`. On top of that it gets a score from things you can see in git, no model
+involved:
 
-- the message says fix, bug, regression, race, crash, leak, revert, workaround and so on, or uses a
-  conventional `fix:` prefix
 - it links an issue or PR (`#412`, `JIRA-88`, a GitHub or Jira URL)
 - it adds or changes a test file
 - it's small (a few files, a few dozen lines)
 
-Merge commits, lockfile and dependency bumps, docs-only commits and huge commits count against it.
+Links and tests raise the score, but never make a fix on their own. Some commits say "fix" and
+still aren't one, so they're left out:
+
+- housekeeping: `fix(deps):`, `fix(ci):`, `fix(docs):` and similar scopes, `build(deps):`, `deps:`,
+  `docs:`, `style:`, `ci:`, `test:`, `refactor:`, `chore:` (unless it names a crash, race, leak,
+  regression or CVE), version bumps, and typo, spelling, lint and formatting commits
+- features: a subject that starts with add, support, implement, allow, introduce, feat or new,
+  unless the subject itself says fix. "Fixes #12" in the body doesn't count.
+- anything over 40 files or 1500 changed lines, and merge commits
+- `Revert "Revert ..."`. A plain revert only counts when its own message has fix wording or an
+  issue link.
+
 The reasons are stored with each commit so every warning can say why it thinks this was a fix.
 
 **The index.** For each fix commit, Chesterton stores a hash of every meaningful line it added and
 removed, per file, following renames forward to the file's current name. Braces, blank lines,
-`else {`, imports and other lines that mean nothing on their own are skipped. The index lives in
+`else {`, imports, `require()` lines, version pins and other lines that mean nothing on their own
+are skipped. Docs, changelogs, CI config and lockfiles are skipped entirely. The index lives in
 `.git/chesterton/`, so it's never committed and never leaves your machine. It updates incrementally
 as HEAD moves.
 
@@ -86,7 +99,8 @@ adds, then looks for two things:
    fix commits deleted from this file. Two or more matching lines in a row is a strong hit.
 
 Weaker matches (a line a fix only touched, a line right next to one a fix added, a single long line
-that a fix removed) don't block anything. They get passed to Claude as a note.
+that a fix removed, removing lines from a test file) don't block anything. They get passed to
+Claude as a note. An edit that only re-wraps or re-indents code is ignored.
 
 **When the session ends**, a Stop hook sweeps the files Claude changed against HEAD, so a fix taken
 apart across several small edits still shows up in a short summary.
@@ -103,7 +117,7 @@ Optional. Put a `.chesterton.yml` at the repo root. See
 | Key | Default | What it does |
 |---|---|---|
 | `mode` | `speedbump` | `speedbump` denies a strong hit once per file and fix, then lets a retry through. `ask` hands strong hits to you to approve. `warn-only` never blocks, it only adds notes. |
-| `history` | `3y` | How far back to look for fixes: `all`, or a span like `18m`, `6w`, `90d`. |
+| `history` | `all` | How far back to look for fixes: `all`, or a span like `3y`, `18m`, `6w`, `90d`. Old fixes matter too, so the default is all of it, capped by `max_commits`. |
 | `max_commits` | `20000` | Hard cap on commits walked when building the index. |
 | `protect` | `[]` | Globs where a strong hit always asks you, whatever the mode. For example `src/payments/**`. |
 | `fix_patterns_extra` | `[]` | Extra regexes that count as fix words in commit messages, like `SEV\d` or `postmortem`. |
@@ -141,9 +155,9 @@ node path/to/chesterton/dist/cli.js check --staged
 
 ## What it won't catch
 
-- **Messy history.** If your commits say "wip" and "stuff" and never touch tests, Chesterton has much
-  less to go on. The test-file and small-diff signals help, but it works best on repos with decent
-  commit messages.
+- **Fixes that don't say so.** A commit has to use fix wording to count. "Restrict URL preparation
+  to HTTP/HTTPS" may well be a fix, but nothing in the message says it, so it isn't indexed. If your
+  team has its own words for fixes, add them to `fix_patterns_extra`.
 - **Squash-merged history** where a fix was bundled into a big feature commit. The fix is in there,
   but the commit doesn't look like a fix, so it isn't indexed.
 - **Code that moved.** If a fix's lines moved to another file without git seeing it as a rename, the

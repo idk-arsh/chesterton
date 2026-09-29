@@ -65,6 +65,9 @@ describe("index-store", () => {
     expect(loadIndex(r.dir)).toBeNull();
     writeFileSync(file, JSON.stringify({ ...sample(), version: 99 }));
     expect(loadIndex(r.dir)).toBeNull();
+    // Version 1 indexes were built with the old classifier and must be rebuilt.
+    writeFileSync(file, JSON.stringify({ ...sample(), version: 1 }));
+    expect(loadIndex(r.dir)).toBeNull();
   });
 
   it("loadIndex returns null outside a repo", () => {

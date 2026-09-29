@@ -68,11 +68,22 @@ function fixHeader(fix: FixCommit): string {
   return `Fix: ${short(fix.sha)} (${date}${who}) "${fix.subject}"`;
 }
 
+/** Most test files or refs named in one message. */
+const MAX_LISTED = 3;
+
+/** "a, b, c and 4 more" style cap for lists shown to Claude or the user. */
+export function capList(items: string[], max = MAX_LISTED): string {
+  if (items.length <= max) return items.join(", ");
+  return `${items.slice(0, max).join(", ")} and ${items.length - max} more`;
+}
+
 function whyLine(fix: FixCommit): string {
   const parts = [...fix.reasons];
   const joined = parts.join(" ").toLowerCase();
-  for (const r of fix.refs) if (!joined.includes(r.toLowerCase())) parts.push(`references ${r}`);
-  for (const t of fix.testFiles) if (!joined.includes(t.toLowerCase())) parts.push(`touches test ${t}`);
+  const refs = fix.refs.filter((r) => !joined.includes(r.toLowerCase()));
+  if (refs.length > 0) parts.push(`references ${capList(refs)}`);
+  // The classifier already names up to 3 test files and counts the rest; only add them if it did not.
+  if (!/\btests?\b/.test(joined) && fix.testFiles.length > 0) parts.push(`touches test ${capList(fix.testFiles)}`);
   return parts.length > 0 ? `Why it looks like a fix: ${parts.join("; ")}` : "";
 }
 

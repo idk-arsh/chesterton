@@ -6,6 +6,10 @@ import { appendFileSync, existsSync as existsSync2, readFileSync as readFileSync
 import { dirname, join as join6, resolve as resolve3 } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// src/types.ts
+var FIX_THRESHOLD = 3;
+var INDEX_VERSION = 2;
+
 // src/normalize.ts
 import { createHash } from "node:crypto";
 function normalizeLine(raw) {
@@ -63,6 +67,18 @@ function isTrivial(normalized) {
   if (normalized.length < 4) return true;
   if (/^[\s{}()[\];,.:]*$/.test(normalized)) return true;
   if (/^(import|from|use|require|#include|using|package)\b/.test(normalized)) return true;
+  if (/^(var|let|const)\s+[\w$\s{},:]+=\s*require\(\s*["'`][^"'`]+["'`]\s*\)(\s*\(\s*["'`][^"'`]*["'`]\s*\)|\.[\w$]+)*\s*[;,]?$/.test(normalized)) return true;
+  if (isVersionPin(normalized)) return true;
+  if (/^(["'`])(?:(?!\1)[^\\]|\\.)*\1,$/.test(normalized)) return true;
+  return false;
+}
+function isVersionPin(n) {
+  const ver = String.raw`[~^<>=!]*\s*v?\d+(?:\.[\w*+-]+)*`;
+  if (new RegExp(String.raw`^["'][@\w./-]+["']\s*:\s*["']${ver}["'],?$`).test(n)) return true;
+  if (new RegExp(String.raw`^[\w.-]+\s*=\s*["']${ver}["'],?$`).test(n) && /\d\.\d/.test(n)) return true;
+  if (/^[A-Za-z][\w.-]*(\[[\w,.-]+\])?\s*(==|>=|<=|~=|!=|>|<)\s*\d+\.[\w.*]*(\s*,\s*(==|>=|<=|~=|!=|>|<)\s*\d[\w.*]*)*(\s*;.*)?$/.test(n)) return true;
+  if (/^(-\s*)?uses:\s*["']?[\w./-]+@[\w.-]+["']?(\s*#.*)?$/.test(n)) return true;
+  if (/^(-\s*)?rev:\s*["']?v?\d[\w.-]*["']?$/.test(n)) return true;
   return false;
 }
 function hashLine(normalized) {
@@ -115,7 +131,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 var DEFAULT_CONFIG = {
   mode: "speedbump",
-  history: "3y",
+  history: "all",
   maxCommits: 2e4,
   protect: [],
   fixPatternsExtra: [],
@@ -332,12 +348,6 @@ function loadConfig(repoRoot2) {
 // src/index-store.ts
 import { existsSync, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join as join2, resolve } from "node:path";
-
-// src/types.ts
-var FIX_THRESHOLD = 3;
-var INDEX_VERSION = 1;
-
-// src/index-store.ts
 var INDEX_FILE = "index.json";
 var dirCache = /* @__PURE__ */ new Map();
 function indexDir(repoRoot2) {
@@ -378,6 +388,19 @@ function recordsForFile(idx, relPath) {
 // src/classify.ts
 var KEYWORD_RE = /\b(fix(?:e[sd])?|bug|hotfix|regression|revert|race|deadlock|crash|leak|workaround|incident|cve-\d+|oncall|segfault|null ?pointer|npe|off.by.one)\b/gi;
 var CONVENTIONAL_FIX_RE = /^fix(\(.+\))?!?:/i;
+var NOISE_FIX_SCOPE_RE = /^fix\((deps|devdeps|dev-deps|ci|build|refactor|docs|lint|style|typo|test|tests)\)!?:/i;
+var NOISE_PREFIX_RE = /^((build|chore)\(deps\)|deps(\([^)]*\))?|(docs?|style|lint|ci|tests?|refactor)(\([^)]*\))?)!?:|^(update (to )?)?@?[\w./-]+@\^?v?\d+\.\d+/i;
+var CHORE_RE = /^chore(\([^)]*\))?!?:/i;
+var STRONG_KEYWORD_RE = /\b(race|crash(e[sd])?|leak(s|ed)?|regression|cve-\d+|deadlock|segfault|security|vulnerab\w*)\b/i;
+var NOISE_WORDS_RE = /\b(bump(s|ed)?|typos?|spelling|misspell\w*|codespell|lint(s|er|ers|ing)?|clippy|formatting|reformat\w*|rustfmt|prettier|whitespace)\b|\b(update[sd]?|upgrade[sd]?)\b.*\b(dependency|dependencies|deps|dev-?dependencies)\b|^(\S+:\s*)?(run |apply )?(format|fmt)\b/i;
+var FEATURE_RE = /^(\S+:\s*)?(add|adds|added|support|supports|implement|implements|allow|allows|introduce|introduces|feat|feature|new|enable|enables)\b/i;
+var REFACTOR_RE = /^(\S+:\s*)?(refactor\w*|rename[sd]?|clean ?up|cleanups?|tidy|reorgani[sz]e\w*)\b/i;
+var CLOSER_RE = /\b(fix(?:e[sd])?|close[sd]?|resolve[sd]?)\b[:\s]+(#\d+|gh-\d+|https?:\/\/\S+)/gi;
+var REVERT_SUBJECT_RE = /^revert\b/i;
+var DOUBLE_REVERT_RE = /^revert\s*"\s*revert\b/i;
+var REVERTS_LINE_RE = /^this reverts commit [0-9a-f]{7,40}\.?\s*$/gim;
+var MAX_FIX_FILES = 40;
+var MAX_FIX_LINES = 1500;
 var NOT_TICKETS = /* @__PURE__ */ new Set(["UTF", "SHA", "ISO", "RFC", "TLS", "SSL", "HTTP", "MD", "AES", "RSA", "IPV", "X", "CP", "WIN"]);
 var LOCKFILES = /* @__PURE__ */ new Set([
   "package-lock.json",
@@ -436,6 +459,16 @@ function isDepFile(path) {
 function isFormatFile(path) {
   return FORMAT_FILES.has(basename(toPosix(path)).toLowerCase());
 }
+function isNoiseFile(path) {
+  const p = toPosix(path).replace(/^\.\//, "");
+  const lower = p.toLowerCase();
+  const b = basename(lower);
+  if (isLockfile(p)) return true;
+  if (/\.(md|mdx|markdown|rst|txt|adoc)$/.test(b) && b !== "cmakelists.txt") return true;
+  if (/^(history|changelog|changes|news|readme|authors|contributors|license|licence|copying)(-[\w.-]+)?(\.(md|markdown|rst|txt|adoc|html))?$/.test(b)) return true;
+  if (/^(docs?|\.github|\.circleci)\//.test(lower)) return true;
+  return /^(\.gitlab-ci\.yml|\.travis\.yml|\.?appveyor\.yml|azure-pipelines\.yml|\.pre-commit-config\.yaml)$/.test(lower);
+}
 function isDocFile(path) {
   const p = toPosix(path).toLowerCase();
   const b = basename(p);
@@ -482,6 +515,23 @@ function matchesIgnore(sha, ignore) {
     return q.length >= 4 && s.startsWith(q);
   });
 }
+function demotion(subject, message, extra) {
+  const s = subject.trim();
+  if (NOISE_FIX_SCOPE_RE.test(s)) return `conventional scope '${s.slice(0, s.indexOf(")") + 1)}' is housekeeping`;
+  if (NOISE_PREFIX_RE.test(s)) return "dependency or housekeeping commit";
+  if (CHORE_RE.test(s) && !STRONG_KEYWORD_RE.test(message)) return "chore commit";
+  const noise = NOISE_WORDS_RE.exec(s);
+  if (noise) return `subject says '${noise[0].trim().toLowerCase().slice(0, 40)}'`;
+  const feature = FEATURE_RE.test(s);
+  const refactor = !feature && REFACTOR_RE.test(s) && !STRONG_KEYWORD_RE.test(message);
+  if (feature || refactor) {
+    const plain = s.replace(CLOSER_RE, " ");
+    if (!new RegExp(KEYWORD_RE.source, "i").test(plain) && !extra.some((re) => re.test(plain))) {
+      return feature ? "subject describes a feature" : "subject describes a refactor";
+    }
+  }
+  return null;
+}
 function classifyCommit(input, cfg) {
   const reasons = [];
   let score = 0;
@@ -489,14 +539,20 @@ function classifyCommit(input, cfg) {
   const body = input.body ?? "";
   const message = body ? `${subject}
 ${body}` : subject;
+  const isRevert = REVERT_SUBJECT_RE.test(subject.trim());
+  const isDoubleRevert = DOUBLE_REVERT_RE.test(subject.trim());
+  const signalText = isRevert ? `${subject.replace(/"[\s\S]*"/, " ")}
+${body.replace(REVERTS_LINE_RE, " ")}` : message;
   const fixReasons = [];
   if (CONVENTIONAL_FIX_RE.test(subject.trim())) fixReasons.push("conventional commit type 'fix:'");
   const words = [];
-  for (const m of message.matchAll(KEYWORD_RE)) {
+  for (const m of signalText.matchAll(KEYWORD_RE)) {
     const w = m[1].toLowerCase();
+    if (isRevert && w === "revert") continue;
     if (!words.includes(w)) words.push(w);
   }
   if (words.length > 0) fixReasons.push(`message says ${words.slice(0, 3).map((w) => `'${w}'`).join(", ")}`);
+  const extra = [];
   for (const src of cfg.fixPatternsExtra ?? []) {
     let re;
     try {
@@ -504,14 +560,17 @@ ${body}` : subject;
     } catch {
       continue;
     }
+    extra.push(re);
     const m = message.match(re);
     if (m) fixReasons.push(`message matches custom pattern /${src}/ ('${m[0]}')`);
   }
-  if (fixReasons.length > 0) {
+  const refs = extractRefs(message);
+  if (isRevert && fixReasons.length === 0 && extractRefs(signalText).length > 0) fixReasons.push("reverts a change tied to an issue");
+  const hasSignal = fixReasons.length > 0;
+  if (hasSignal) {
     score += 3;
     reasons.push(...fixReasons);
   }
-  const refs = extractRefs(message);
   if (refs.length > 0) {
     score += 1;
     reasons.push(`references ${refs.slice(0, 3).join(", ")}`);
@@ -531,14 +590,16 @@ ${body}` : subject;
     reasons.push(...testReasons.slice(0, 3));
     if (testReasons.length > 3) reasons.push(`and ${testReasons.length - 3} more test files`);
   }
-  const changed = files.reduce((n, f) => n + (f.added || 0) + (f.removed || 0), 0);
-  if (files.length > 0 && files.length <= 5 && changed <= 60) {
+  const counted = files.filter((f) => !isNoiseFile(f.path));
+  const changed = counted.reduce((n, f) => n + (f.added || 0) + (f.removed || 0), 0);
+  if (counted.length > 0 && counted.length <= 5 && changed <= 60) {
     score += 1;
-    reasons.push(`small change (${files.length} file${files.length === 1 ? "" : "s"}, ${changed} line${changed === 1 ? "" : "s"})`);
+    reasons.push(`small change (${counted.length} file${counted.length === 1 ? "" : "s"}, ${changed} line${changed === 1 ? "" : "s"})`);
   }
-  if (files.length > 40) {
+  const tooBig = counted.length > MAX_FIX_FILES || changed > MAX_FIX_LINES;
+  if (tooBig) {
     score -= 3;
-    reasons.push(`large change (${files.length} files)`);
+    reasons.push(`large change (${counted.length} files, ${changed} lines)`);
   }
   if (input.parents > 1) {
     score -= 5;
@@ -548,12 +609,23 @@ ${body}` : subject;
     if (files.every((f) => isDocFile(f.path))) {
       score -= 5;
       reasons.push("only touches docs");
-    } else if (files.every((f) => isLockfile(f.path) || isDepFile(f.path) || isFormatFile(f.path) || isDocFile(f.path))) {
+    } else if (files.every((f) => isLockfile(f.path) || isDepFile(f.path) || isFormatFile(f.path) || isNoiseFile(f.path))) {
       score -= 5;
-      reasons.push("only touches lockfiles, dependency or formatting files");
+      reasons.push("only touches lockfiles, dependency, CI or formatting files");
     }
   }
-  let isFix = score >= FIX_THRESHOLD;
+  let isFix = hasSignal && !tooBig && score >= FIX_THRESHOLD;
+  if (!hasSignal) reasons.push("no fix wording in the message");
+  if (isDoubleRevert) {
+    isFix = false;
+    reasons.push("not a fix: puts back a reverted change");
+  } else if (hasSignal) {
+    const why = demotion(subject, message, extra);
+    if (why) {
+      isFix = false;
+      reasons.push(`not a fix: ${why}`);
+    }
+  }
   if (matchesIgnore(input.sha, cfg.ignoreCommits ?? [])) {
     isFix = false;
     reasons.push("listed in ignoreCommits");
@@ -859,6 +931,12 @@ function readCurrent(repoRoot2, relPath) {
     return null;
   }
 }
+function isWhitespaceReflow(change) {
+  if (change.isNewFile || change.removed.length === 0 || change.added.length === 0) return false;
+  const squash = (lines) => lines.join("").replace(/\s+/g, "");
+  const before = squash(change.removed.map((r) => r.text));
+  return before.length > 0 && before === squash(change.added);
+}
 function mergeRanges(ranges) {
   const sorted = [...ranges].sort((x, y) => x[0] - y[0]);
   const out = [];
@@ -870,6 +948,8 @@ function mergeRanges(ranges) {
   return out;
 }
 function analyzeChange(repoRoot2, change, idx, cfg, deps = {}) {
+  if (isNoiseFile(change.relPath)) return [];
+  if (isWhitespaceReflow(change)) return [];
   const records = recordsForFile(idx, change.relPath).filter(
     (r) => idx.commits[r.sha] && !isIgnored(r.sha, cfg) && !isPureMove(r)
   );
@@ -878,7 +958,11 @@ function analyzeChange(repoRoot2, change, idx, cfg, deps = {}) {
   const currentLines = current === null ? [] : splitLines(current);
   if (!change.isNewFile) {
     const removed = change.removed.map((r) => ({ ...r, norm: normalizeLine(r.text) })).filter((r) => !isTrivial(r.norm));
-    if (removed.length > 0) hits.push(...removesFix(repoRoot2, change, removed, records, idx, cfg, deps, currentLines.length));
+    if (removed.length > 0) {
+      const found = removesFix(repoRoot2, change, removed, records, idx, cfg, deps, currentLines.length);
+      if (isTestFile(change.relPath)) for (const h of found) h.strength = "weak";
+      hits.push(...found);
+    }
   }
   if (records.length > 0 && change.added.length > 0) hits.push(...readdsRemoved(change, records, currentLines));
   const byKey = /* @__PURE__ */ new Map();
@@ -1052,11 +1136,17 @@ function fixHeader(fix) {
   const who = fix.author ? `, ${fix.author}` : "";
   return `Fix: ${short(fix.sha)} (${date}${who}) "${fix.subject}"`;
 }
+var MAX_LISTED = 3;
+function capList(items, max = MAX_LISTED) {
+  if (items.length <= max) return items.join(", ");
+  return `${items.slice(0, max).join(", ")} and ${items.length - max} more`;
+}
 function whyLine(fix) {
   const parts = [...fix.reasons];
   const joined = parts.join(" ").toLowerCase();
-  for (const r of fix.refs) if (!joined.includes(r.toLowerCase())) parts.push(`references ${r}`);
-  for (const t of fix.testFiles) if (!joined.includes(t.toLowerCase())) parts.push(`touches test ${t}`);
+  const refs = fix.refs.filter((r) => !joined.includes(r.toLowerCase()));
+  if (refs.length > 0) parts.push(`references ${capList(refs)}`);
+  if (!/\btests?\b/.test(joined) && fix.testFiles.length > 0) parts.push(`touches test ${capList(fix.testFiles)}`);
   return parts.length > 0 ? `Why it looks like a fix: ${parts.join("; ")}` : "";
 }
 function linesBlock(f) {
@@ -1364,10 +1454,10 @@ function addedLinesInCommit(root, sha, path, timeoutMs) {
 function fallbackFindings(root, change, cfg, deadline) {
   if (change.isNewFile || change.removed.length === 0) return [];
   const blame = memoBlame(deadline);
-  const empty = { version: 1, head: "", builtAt: "", commits: {}, files: {} };
+  const empty = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: {} };
   const removalOnly = { ...change, added: [] };
   analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn });
-  const idx = { version: 1, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
+  const idx = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
   let n = 0;
   for (const sha of blame.shas) {
     if (n++ >= MAX_FALLBACK_COMMITS) break;

@@ -2,7 +2,7 @@ import { closeSync, openSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { ChestertonConfig, ChestertonIndex, FileFixRecord, FixCommit, LineEntry } from "./types.js";
 import { INDEX_VERSION } from "./types.js";
-import { classifyCommit, isLockfile, type CommitFileChange } from "./classify.js";
+import { classifyCommit, isNoiseFile, type CommitFileChange } from "./classify.js";
 import { emptyIndex, indexDir, loadIndex, saveIndex } from "./index-store.js";
 import { headSha, isAncestor, runGit, runGitWithInput } from "./git.js";
 import { hashLine, isTrivial, normalizeLine, toPosix } from "./normalize.js";
@@ -252,7 +252,7 @@ export function parsePatches(out: string): Map<string, FileFixRecord[]> {
     const flush = () => {
       const path = sawHeaders ? newP : renameTo;
       const prev = sawHeaders ? oldP : renameFrom;
-      if (path && !isLockfile(path) && (added.length || removed.length)) {
+      if (path && !isNoiseFile(path) && (added.length || removed.length)) {
         const rec: FileFixRecord = { sha, path, added, removed };
         if (prev && prev !== path) rec.oldPath = prev;
         dropMoves(rec);

@@ -9,6 +9,7 @@ import { indexDir, loadIndex } from "./index-store.js";
 import { analyzeChange } from "./analyze.js";
 import { blameAt, gitDiffChanges } from "./diff-change.js";
 import { explainLine } from "./why.js";
+import { capList } from "./decide.js";
 import type { ChestertonIndex, Finding } from "./types.js";
 
 export const VERSION = "0.1.0";
@@ -282,7 +283,7 @@ export function formatFinding(f: Finding): string {
   ];
   if (c.reasons.length) out.push(`  Why it looks like a fix: ${c.reasons.join("; ")}`);
   if (c.refs.length) out.push(`  Refs: ${c.refs.join(", ")}`);
-  if (c.testFiles.length) out.push(`  Tests: ${c.testFiles.join(", ")}`);
+  if (c.testFiles.length) out.push(`  Tests: ${capList(c.testFiles)}`);
   if (f.lines.length) {
     out.push("  Lines:");
     for (const l of f.lines) out.push(`    ${l}`);
