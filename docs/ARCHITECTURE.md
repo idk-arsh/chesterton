@@ -19,6 +19,9 @@ Index what every fix commit added and removed. On each edit, flag it when the ed
 - The hook must **fail open**: any error, timeout, missing git, not-a-repo, missing index means exit 0 with no output. Never block the user because Chesterton broke.
 - No network, no model calls, no telemetry. Everything stays in `<git-dir>/chesterton/`.
 - Windows, macOS, Linux. Watch CRLF, backslash paths, spaces in paths. Always repo-relative forward-slash paths internally (`toPosix`).
+- Treat the repo as untrusted input. On Windows git is started by absolute path from PATH (`gitExecutable` in `src/git.ts`),
+  since Node before 22 would run a `git.exe` sitting in the repo. Globs and regexes from `.chesterton.yml` must not be
+  able to hang the hook: `protect` globs are matched without backtracking and nested-repeat regexes are skipped.
 - Shared contracts live in `src/types.ts` and `src/normalize.ts`. Both halves of the code depend on them, so change them with care.
 - Every module gets vitest tests using `test/helpers/repo.ts` (real throwaway git repos).
 - Public text (README, messages Claude sees) in plain human voice. No em dashes.
@@ -81,7 +84,7 @@ export function changeFromToolCall(repoRoot: string, toolName: string, toolInput
 //   Edit: {file_path, old_string, new_string, replace_all}. Write: {file_path, content}. MultiEdit (legacy): {file_path, edits[]}.
 //   Returns [] for paths outside the repo, unreadable files, or when old_string is not found.
 export function diffLines(before: string[], after: string[]): { removed: { line: number; text: string }[]; added: string[] };
-//   LCS based, exported so C's `check` command can reuse it.
+//   Myers diff after trimming the common prefix and suffix. Exported so the Stop sweep can reuse it.
 
 // src/analyze.ts
 export function analyzeChange(repoRoot: string, change: EditChange, idx: ChestertonIndex, cfg: ChestertonConfig, deps?: AnalyzeDeps): Finding[];
@@ -113,7 +116,7 @@ export function changesFromGitDiff(repoRoot: string, range: { staged?: boolean; 
 export function explainLine(repoRoot: string, relPath: string, line: number, idx: ChestertonIndex | null): string; // human readable
 
 // src/cli.ts (entry point, bundled to dist/cli.js)
-//   chesterton index [--full] [--quiet]
+//   chesterton index [--full] [--quiet]           killed by a watchdog worker after 10 minutes
 //   chesterton why <file>:<line>
 //   chesterton check [--staged | --base <rev>]   exit 1 on strong findings (for pre-commit / CI)
 //   chesterton status
@@ -146,7 +149,8 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
   - +2 the commit adds or modifies a test file (`test/`, `tests/`, `__tests__/`, `spec/`, `*_test.*`, `*.test.*`, `*.spec.*`, `test_*.py`)
   - +1 small change (<= 5 files and <= 60 changed lines)
   - -5 merge commit, -5 only lockfiles/deps/formatting/docs/CI, -3 more than 40 files or 1500 lines
-  - cfg.fixPatternsExtra regexes count like the keyword rule
+  - cfg.fixPatternsExtra regexes count like the keyword rule. The config skips any that repeat a group holding a
+    repeat (`(a+)+`), since `.chesterton.yml` comes from the repo and such a regex can hang the indexer.
 - isFix also needs (index version 2):
   - a **fix signal**: the keyword rule, conventional `fix:`, or a fixPatternsExtra match. Refs, tests and size only add score.
   - not **demoted**: `fix(deps|devdeps|dev-deps|ci|build|refactor|docs|lint|style|typo|test|tests):`, `build(deps):`, `deps:`,
