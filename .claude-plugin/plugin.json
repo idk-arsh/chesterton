@@ -1,0 +1,14 @@
+{
+  "name": "chesterton",
+  "displayName": "Chesterton",
+  "version": "0.1.0",
+  "description": "Stops Claude from quietly undoing past bug fixes. Checks every edit against the fix commits in your git history.",
+  "author": {
+    "name": "Arsh Singh",
+    "url": "https://github.com/idk-arsh"
+  },
+  "homepage": "https://github.com/idk-arsh/chesterton",
+  "repository": "https://github.com/idk-arsh/chesterton",
+  "license": "MIT",
+  "keywords": ["git", "regression", "bug-fix", "history", "code-review", "hooks", "blame"]
+}

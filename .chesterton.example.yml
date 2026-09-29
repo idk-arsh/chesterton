@@ -1,0 +1,26 @@
+# Copy to .chesterton.yml at the repo root. Every key is optional.
+
+# speedbump: deny a strong hit once per file and fix, then let a retry through (default)
+# ask:       hand strong hits to the human to approve
+# warn-only: never block, only add notes for Claude
+mode: speedbump
+
+# How far back to look for fix commits: all, or a span like 3y, 18m, 6w, 90d.
+history: 3y
+
+# Hard cap on commits walked when building the index.
+max_commits: 20000
+
+# Paths where a strong hit always asks the human, whatever the mode.
+protect:
+  - src/payments/**
+  - "infra/*.tf"
+
+# Extra regexes that count as fix words in commit messages.
+fix_patterns_extra: ["SEV\d", "postmortem"]
+
+# Commits that should never count as fixes (full shas or prefixes).
+ignore_commits: []
+
+# Time budget for the edit check, in milliseconds. Past it, the edit is allowed.
+hook_timeout_ms: 1500

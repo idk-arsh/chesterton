@@ -1,0 +1,17 @@
+{
+  "name": "chesterton",
+  "description": "Chesterton: a Claude Code plugin that stops Claude from quietly undoing past bug fixes.",
+  "owner": {
+    "name": "Arsh Singh",
+    "url": "https://github.com/idk-arsh"
+  },
+  "plugins": [
+    {
+      "name": "chesterton",
+      "source": "./",
+      "description": "Stops Claude from quietly undoing past bug fixes. Checks every edit against the fix commits in your git history.",
+      "category": "development",
+      "homepage": "https://github.com/idk-arsh/chesterton"
+    }
+  ]
+}
