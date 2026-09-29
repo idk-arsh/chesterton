@@ -203,3 +203,24 @@ export function isAncestor(cwd: string, ancestor: string, descendant: string, ti
     return false;
   }
 }
+
+/**
+ * Repo-relative paths that differ from HEAD in the working tree or index: modified, added,
+ * deleted, renamed (new path) and untracked files. Throws GitError when git fails.
+ */
+export function dirtyFiles(cwd: string, timeoutMs = 5_000): string[] {
+  const out = runGit(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], cwd, timeoutMs);
+  const parts = out.split("\0");
+  const files: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i]!;
+    if (entry.length < 4) continue;
+    const xy = entry.slice(0, 2);
+    const path = entry.slice(3);
+    // Rename and copy entries carry the old path as the next field.
+    if (/[RC]/.test(xy)) i++;
+    if (xy === "!!" || path.endsWith("/")) continue;
+    files.push(path);
+  }
+  return files;
+}

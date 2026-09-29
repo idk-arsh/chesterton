@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import { explainLine } from "../src/why.js";
 import { buildIndex } from "../src/index-builder.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
@@ -87,5 +88,30 @@ describe("explainLine", () => {
     repo = f.repo;
     expect(explainLine(repo.dir, "nope.ts", 1, null)).toContain("file not found");
     expect(explainLine(repo.dir, "src/socket.ts", 99, null)).toContain("no such line");
+  });
+
+  it("shows one date per commit: the author date in the author's own time zone", () => {
+    repo = makeRepo();
+    const r = repo;
+    r.write("src/socket.ts", BEFORE);
+    r.commit("initial");
+    r.write("src/socket.ts", AFTER);
+    r.write("test/socket.test.ts", "it('closes cleanly under load', () => {});\n");
+    r.git("add", "-A");
+    // Late evening in UTC-5 is already the next day in UTC.
+    const date = "2025-03-14T23:30:00-05:00";
+    const res = spawnSync("git", ["commit", "-q", "-m", "fix: race on socket close (#412)"], {
+      cwd: r.dir,
+      encoding: "utf8",
+      env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: "2025-03-16T12:00:00+00:00" },
+      windowsHide: true,
+    });
+    expect(res.status).toBe(0);
+    const sha = r.git("rev-parse", "HEAD").trim().slice(0, 7);
+    const text = explainLine(r.dir, "src/socket.ts", 3, buildIndex(r.dir, DEFAULT_CONFIG));
+    expect(text).toContain(`Last touched by ${sha} on 2025-03-14`);
+    expect(text).toContain(`${sha}  2025-03-14  fix: race on socket close (#412)`);
+    expect(text).not.toContain("2025-03-15");
+    expect(text).not.toContain("2025-03-16");
   });
 });

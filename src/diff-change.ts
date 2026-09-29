@@ -221,6 +221,20 @@ export function blameAt(repoRoot: string, relPath: string, start: number, end: n
   return parseBlamePorcelain(out, relPath);
 }
 
+/**
+ * Unix time as ISO 8601 in the author's own time zone, the same shape `git log --format=%aI`
+ * prints, so a date shown from blame matches one shown from log or the index.
+ */
+export function isoInZone(unixSeconds: number, tz: string): string {
+  const m = /^([+-])(\d{2})(\d{2})$/.exec(tz.trim());
+  const offsetMin = m ? (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : 0;
+  const local = new Date((unixSeconds + offsetMin * 60) * 1000).toISOString().slice(0, 19);
+  const sign = offsetMin < 0 ? "-" : "+";
+  const abs = Math.abs(offsetMin);
+  const zone = `${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+  return `${local}${zone}`;
+}
+
 export function parseBlamePorcelain(out: string, relPath: string): BlameInfo[] {
   const meta = new Map<string, { author: string; date: string; summary: string; path: string }>();
   const result: BlameInfo[] = [];
@@ -247,7 +261,7 @@ export function parseBlamePorcelain(out: string, relPath: string): BlameInfo[] {
     else if (line.startsWith("filename ")) m.path = toPosix(unquotePath(line.slice(9)));
     else if (line.startsWith("\t")) {
       if (!meta.has(pending.sha)) {
-        const date = m.time ? new Date(m.time * 1000).toISOString() : "";
+        const date = m.time ? isoInZone(m.time, m.tz) : "";
         meta.set(pending.sha, { author: m.author, date, summary: m.summary, path: m.path });
       }
       const info = meta.get(pending.sha)!;

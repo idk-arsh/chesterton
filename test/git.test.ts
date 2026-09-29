@@ -4,7 +4,7 @@ vi.setConfig({ testTimeout: 60_000 });
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { findRepoInJs, locateRepo, repoRoot, runGit } from "../src/git.js";
+import { dirtyFiles, findRepoInJs, locateRepo, repoRoot, runGit } from "../src/git.js";
 import { indexDir } from "../src/index-store.js";
 import { makeRepo, type TestRepo } from "./helpers/repo.js";
 
@@ -136,5 +136,23 @@ describe("finding the repo without starting git", () => {
     r.git("config", "core.worktree", r.dir);
     expect(() => findRepoInJs(r.dir)).toThrow();
     expect(locateRepo(r.dir)?.root).toBe(r.git("rev-parse", "--show-toplevel").trim());
+  });
+});
+
+describe("dirtyFiles", () => {
+  it("lists modified, staged, deleted and untracked files, not ignored ones", () => {
+    const r = repo();
+    r.write("a.ts", "a\n");
+    r.write("b.ts", "b\n");
+    r.write("c.ts", "c\n");
+    r.write(".gitignore", "*.log\n");
+    r.commit("initial");
+    r.write("a.ts", "a2\n");
+    r.write("b.ts", "b2\n");
+    r.git("add", "b.ts");
+    r.git("rm", "-q", "c.ts");
+    r.write("new dir/n.ts", "n\n");
+    r.write("x.log", "ignored\n");
+    expect(dirtyFiles(r.dir).sort()).toEqual(["a.ts", "b.ts", "c.ts", "new dir/n.ts"]);
   });
 });

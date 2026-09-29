@@ -1,6 +1,7 @@
 // src/hook.ts
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync as existsSync3, readFileSync as readFileSync8, realpathSync as realpathSync3 } from "node:fs";
+import { createHash as createHash3 } from "node:crypto";
+import { appendFileSync, existsSync as existsSync3, readFileSync as readFileSync8, realpathSync as realpathSync3, statSync as statSync4 } from "node:fs";
 import { dirname as dirname3, isAbsolute as isAbsolute3, join as join8, resolve as resolve4 } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -225,6 +226,21 @@ function shallowInfo(cwd, timeoutMs = 5e3) {
   } catch {
     return { shallow: false, boundary };
   }
+}
+function dirtyFiles(cwd, timeoutMs = 5e3) {
+  const out = runGit(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], cwd, timeoutMs);
+  const parts = out.split("\0");
+  const files = [];
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i];
+    if (entry.length < 4) continue;
+    const xy = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (/[RC]/.test(xy)) i++;
+    if (xy === "!!" || path.endsWith("/")) continue;
+    files.push(path);
+  }
+  return files;
 }
 
 // src/config.ts
@@ -1433,43 +1449,76 @@ function whyLine(fix) {
   if (!/\btests?\b/.test(joined) && fix.testFiles.length > 0) parts.push(`touches test ${capList(fix.testFiles)}`);
   return parts.length > 0 ? `Why it looks like a fix: ${parts.join("; ")}` : "";
 }
-function linesBlock(f) {
-  if (f.lines.length === 0) return "";
-  return `Lines:
-${f.lines.map((l) => `  ${l}`).join("\n")}`;
+function groupByFix(findings) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const f of findings) {
+    let g = groups.get(f.fix.sha);
+    if (!g) {
+      g = { fix: f.fix, strong: false, removes: [], readds: [] };
+      groups.set(f.fix.sha, g);
+    }
+    if (f.strength === "strong") g.strong = true;
+    const into = f.kind === "removes-fix" ? g.removes : g.readds;
+    for (const l of f.lines) if (!into.includes(l)) into.push(l);
+  }
+  return [...groups.values()];
 }
-function findingBlock(f) {
-  return [fixHeader(f.fix), whyLine(f.fix), linesBlock(f)].filter(Boolean).join("\n");
+function indented(lines) {
+  return lines.map((l) => `  ${l}`).join("\n");
 }
-function verb(f) {
-  return f.kind === "removes-fix" ? `removes code that fix ${short(f.fix.sha)} added` : `adds back code that fix ${short(f.fix.sha)} removed`;
+function linesBlock(g) {
+  if (g.removes.length > 0 && g.readds.length > 0) {
+    return `Lines it removes:
+${indented(g.removes)}
+Lines it adds back:
+${indented(g.readds)}`;
+  }
+  const lines = [...g.removes, ...g.readds];
+  return lines.length > 0 ? `Lines:
+${indented(lines)}` : "";
+}
+function groupBlock(g) {
+  return [fixHeader(g.fix), whyLine(g.fix), linesBlock(g)].filter(Boolean).join("\n");
+}
+function verb(g) {
+  const sha = short(g.fix.sha);
+  const removes = g.removes.length > 0;
+  const readds = g.readds.length > 0;
+  if (removes && readds) return `removes code that fix ${sha} added and adds back code it removed`;
+  return readds ? `adds back code that fix ${sha} removed` : `removes code that fix ${sha} added`;
+}
+function headline(groups, relPath, withList) {
+  if (groups.length === 1) return `Chesterton: this edit to ${relPath} ${verb(groups[0])}.`;
+  const list = withList ? ` (${groups.map(verb).join("; ")})` : "";
+  return `Chesterton: this edit to ${relPath} touches ${groups.length} past bug fixes${list}.`;
 }
 function denyReason(strong, relPath) {
-  const head = strong.length === 1 ? `Chesterton: this edit to ${relPath} ${verb(strong[0])}.` : `Chesterton: this edit to ${relPath} touches ${strong.length} past bug fixes (${strong.map(verb).join("; ")}).`;
-  const blocks = strong.map(findingBlock).join("\n\n");
-  const shas = [...new Set(strong.map((f) => short(f.fix.sha)))];
-  const show = shas.map((s) => `git show ${s}`).join(", ");
-  const anyReadd = strong.some((f) => f.kind === "re-adds-removed");
-  const anyRemove = strong.some((f) => f.kind === "removes-fix");
+  const groups = groupByFix(strong);
+  const blocks = groups.map(groupBlock).join("\n\n");
+  const show = groups.map((g) => `git show ${short(g.fix.sha)}`).join(", ");
+  const anyReadd = groups.some((g) => g.readds.length > 0);
+  const anyRemove = groups.some((g) => g.removes.length > 0);
   const what = anyRemove && anyReadd ? "changing this" : anyRemove ? "removing this" : "adding this back";
-  const tail = `Before ${what}, check the fix commit (${show}). Keep the fix, or rework the change around it. If you are sure it is safe, tell the user why, then retry the same edit and Chesterton will let it through.`;
-  return `${head}
+  const tail = `Before ${what}, check the fix commit${groups.length === 1 ? "" : "s"} (${show}). Keep the fix, or rework the change around it. If you are sure it is safe, tell the user why, then retry the same edit and Chesterton will let it through.`;
+  return `${headline(groups, relPath, true)}
 
 ${blocks}
 
 ${tail}`;
 }
 function askReason(strong, relPath, prot) {
-  const head = strong.length === 1 ? `Chesterton: this edit to ${relPath} ${verb(strong[0])}.` : `Chesterton: this edit to ${relPath} touches ${strong.length} past bug fixes.`;
+  const groups = groupByFix(strong);
   const why = prot ? `${relPath} is a protected path, so a person has to approve this.` : `Chesterton is set to ask before edits like this.`;
-  return `${head} ${why}
+  return `${headline(groups, relPath, false)} ${why}
 
-${strong.map(findingBlock).join("\n\n")}`;
+${groups.map(groupBlock).join("\n\n")}`;
 }
 function contextText(findings, relPath, note) {
   const intro = note ?? `Chesterton: heads up, this edit to ${relPath} may touch code from a past bug fix. It was allowed; check it still holds.`;
-  const items = findings.map((f) => `- ${f.strength === "strong" ? "" : "possibly "}${verb(f)}
-  ${findingBlock(f).replace(/\n/g, "\n  ")}`);
+  const items = groupByFix(findings).map(
+    (g) => `- ${g.strong ? "" : "possibly "}${verb(g)}
+  ${groupBlock(g).replace(/\n/g, "\n  ")}`
+  );
   return `${intro}
 ${items.join("\n")}`;
 }
@@ -1605,6 +1654,26 @@ function saveSession(repoRoot2, s) {
   }
   writeAtomic(fallbackSessionPath(repoRoot2, s.sessionId), text);
 }
+function baselinePath(repoRoot2, sessionId) {
+  return join7(indexDir(repoRoot2), "baselines", `${sanitizeSessionId(sessionId)}.json`);
+}
+function loadBaseline(repoRoot2, sessionId) {
+  try {
+    const raw = JSON.parse(readFileSync7(baselinePath(repoRoot2, sessionId), "utf8"));
+    if (!raw || typeof raw !== "object" || typeof raw.at !== "string" || typeof raw.complete !== "boolean") return null;
+    if (!raw.files || typeof raw.files !== "object" || Array.isArray(raw.files)) return null;
+    const files = {};
+    for (const [k, v] of Object.entries(raw.files)) {
+      if (typeof v === "string" || v === null) files[k] = v;
+    }
+    return { at: raw.at, complete: raw.complete, files };
+  } catch {
+    return null;
+  }
+}
+function saveBaseline(repoRoot2, sessionId, b) {
+  writeAtomic(baselinePath(repoRoot2, sessionId), JSON.stringify(b));
+}
 
 // src/hook.ts
 var HookTimeout = class extends Error {
@@ -1678,7 +1747,7 @@ function handleHookInput(raw, deps = {}) {
       return preToolUse(root, cfg, sessionId, input, deadline);
     }
     if (event === "SessionStart") {
-      return sessionStart(root, deps);
+      return sessionStart(root, sessionId, deps);
     }
     if (event === "Stop") {
       if (input.stop_hook_active === true) return null;
@@ -1725,9 +1794,10 @@ function samePath(a, b) {
   };
   return norm(a) === norm(b);
 }
-function sessionStart(root, deps) {
+function sessionStart(root, sessionId, deps) {
   const head = headSha(root);
   if (!head) return null;
+  snapshotDirty(root, sessionId);
   const meta = loadMeta(root);
   if (!meta || meta.head !== head) {
     const spawnIt = deps.spawnIndexer ?? defaultSpawnIndexer(deps.cliPath ?? join8(scriptDir(), "cli.js"));
@@ -1745,6 +1815,32 @@ function sessionStart(root, deps) {
       additionalContext: `Chesterton: ${n} fix commit${n === 1 ? "" : "s"} indexed. Edits that undo a past bug fix will be flagged.`
     }
   });
+}
+var MAX_BASELINE_HASHED = 300;
+var MAX_BASELINE_FILES = 5e3;
+var MAX_HASH_BYTES = 2 * 1024 * 1024;
+function contentHash(root, relPath) {
+  const file = join8(root, relPath);
+  try {
+    if (statSync4(file).size > MAX_HASH_BYTES) return null;
+    return createHash3("sha1").update(readFileSync8(file)).digest("hex");
+  } catch (err) {
+    return err.code === "ENOENT" ? "deleted" : null;
+  }
+}
+function snapshotDirty(root, sessionId) {
+  try {
+    if (loadBaseline(root, sessionId)) return;
+    const dirty = dirtyFiles(root, 3e3);
+    const files = {};
+    let hashed = 0;
+    for (const f of dirty.slice(0, MAX_BASELINE_FILES)) {
+      files[f] = hashed++ < MAX_BASELINE_HASHED ? contentHash(root, f) : null;
+    }
+    saveBaseline(root, sessionId, { at: (/* @__PURE__ */ new Date()).toISOString(), complete: dirty.length <= MAX_BASELINE_FILES, files });
+  } catch (err) {
+    logError(root, err);
+  }
 }
 function preToolUse(root, cfg, sessionId, input, deadline) {
   const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -1800,14 +1896,19 @@ ${reason}${extra}` }
 }
 function memoBlame(deadline, inner = blameRange) {
   const cache = /* @__PURE__ */ new Map();
-  const shas = /* @__PURE__ */ new Set();
+  const shas = /* @__PURE__ */ new Map();
   const fn = (r, p, s, e) => {
     const key = `${p}:${s}-${e}`;
     const hit = cache.get(key);
     if (hit) return hit;
     const lines = inner(r, p, s, e, deadline.budget());
     cache.set(key, lines);
-    for (const l of lines) if (!/^0+$/.test(l.sha)) shas.add(l.sha);
+    for (const l of lines) {
+      if (/^0+$/.test(l.sha)) continue;
+      let paths = shas.get(l.sha);
+      if (!paths) shas.set(l.sha, paths = /* @__PURE__ */ new Set());
+      paths.add(l.origPath || p);
+    }
     return lines;
   };
   return { fn, shas };
@@ -1840,7 +1941,7 @@ function fallbackFindings(root, change, cfg, deadline) {
   const idx = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: { [change.relPath]: [] } };
   let n = 0;
   let shallow = null;
-  for (const sha of blame.shas) {
+  for (const [sha, paths] of blame.shas) {
     if (n++ >= MAX_FALLBACK_COMMITS) break;
     if (cfg.ignoreCommits.some((p) => p && sha.startsWith(p))) continue;
     const meta = runGit(["show", "-s", "--format=%H%x00%aI%x00%an%x00%P%x00%s%x00%b", sha], root, deadline.budget());
@@ -1853,8 +1954,11 @@ function fallbackFindings(root, change, cfg, deadline) {
     if (!res.isFix) continue;
     const fix = { sha: full, date, author, subject, score: res.score, reasons: res.reasons, refs: res.refs, testFiles: res.testFiles };
     idx.commits[full] = fix;
-    const added = addedLinesInCommit(root, full, change.relPath, deadline.budget());
-    idx.files[change.relPath].push({ sha: full, path: change.relPath, added, removed: [] });
+    for (const path of paths) {
+      const added = addedLinesInCommit(root, full, path, deadline.budget());
+      const rec = { sha: full, path, added, removed: [] };
+      idx.files[change.relPath].push(rec);
+    }
   }
   if (Object.keys(idx.commits).length === 0) return [];
   deadline.check();
@@ -1876,10 +1980,33 @@ function blameAtHead(root, relPath, start, end, timeoutMs) {
 function shortVerb(f) {
   return f.kind === "removes-fix" ? "removes code added by fix" : "adds back code removed by fix";
 }
+function stopCandidates(root, session, deadline) {
+  const edited = new Set(session.files);
+  const out = [];
+  const base = loadBaseline(root, session.sessionId);
+  if (base && base.complete) {
+    let dirty = [];
+    try {
+      dirty = dirtyFiles(root, Math.min(3e3, deadline.budget()));
+    } catch {
+      dirty = [];
+    }
+    for (const f of dirty) {
+      if (edited.has(f)) continue;
+      if (Object.prototype.hasOwnProperty.call(base.files, f)) {
+        const was = base.files[f];
+        if (was === null || was === void 0 || contentHash(root, f) === was) continue;
+      }
+      out.push(f);
+    }
+  }
+  out.push(...session.files);
+  return out.slice(-MAX_STOP_FILES);
+}
 function stop(root, cfg, sessionId, deadline) {
   const session = loadSession(root, sessionId);
-  if (session.files.length === 0) return null;
-  const files = session.files.slice(-MAX_STOP_FILES);
+  const files = stopCandidates(root, session, deadline);
+  if (files.length === 0) return null;
   const idx = loadIndexForFiles(root, files);
   if (!idx) return null;
   const seen = /* @__PURE__ */ new Set([...session.acknowledged, ...session.findings.map((f) => f.key)]);
@@ -1930,7 +2057,7 @@ function stop(root, cfg, sessionId, deadline) {
     }
   };
   const items = ledger.map((f) => `- ${f.file}: ${shortVerb(f)} ${f.fix.sha.slice(0, 7)} "${f.fix.subject}" (git show ${f.fix.sha.slice(0, 7)})`);
-  const text = `Chesterton: before you finish, ${ledger.length === 1 ? "one change" : `${ledger.length} changes`} from this session touch past bug fixes that were not flagged at edit time:
+  const text = `Chesterton: before you finish, ${ledger.length === 1 ? "one change from this session touches a past bug fix that was" : `${ledger.length} changes from this session touch past bug fixes that were`} not flagged at edit time:
 ${items.join("\n")}
 Check each fix still holds, and tell the user if you removed or reverted one on purpose.`;
   return { text: JSON.stringify({ hookSpecificOutput: { hookEventName: "Stop", additionalContext: text } }), commit };
@@ -1980,6 +2107,7 @@ if (isMain()) void main();
 export {
   addedLinesInCommit,
   blameAtHead,
+  contentHash,
   handleHookInput,
   main
 };

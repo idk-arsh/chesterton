@@ -1,7 +1,7 @@
 ---
 description: Explain why a line of code is there, using git history and the fix commits Chesterton has indexed
 argument-hint: <file:line>
-allowed-tools: Bash(node *), Bash(git show *), Bash(git log *), Read
+allowed-tools: Bash(node *), Bash(git show *), Bash(git log *), Bash(git blame *), Read
 ---
 
 Explain why this line exists: `$ARGUMENTS`

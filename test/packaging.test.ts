@@ -1,4 +1,4 @@
-// Plugin packaging: the dist launchers.
+// Plugin packaging: skill frontmatter and the dist launchers.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -12,6 +12,29 @@ const ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   while (cleanups.length) cleanups.pop()!();
+});
+
+function frontmatter(file: string): Record<string, string> {
+  const text = readFileSync(join(ROOT, file), "utf8");
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+  const out: Record<string, string> = {};
+  for (const line of (m?.[1] ?? "").split(/\r?\n/)) {
+    const kv = /^([a-z-]+):\s*(.*)$/.exec(line);
+    if (kv) out[kv[1]!] = kv[2]!;
+  }
+  return out;
+}
+
+describe("skill and command frontmatter", () => {
+  it("the skill may run node, git show, git log and git blame", () => {
+    const tools = (frontmatter("skills/chesterton/SKILL.md")["allowed-tools"] ?? "").split(",").map((t) => t.trim());
+    for (const t of ["Bash(node *)", "Bash(git show *)", "Bash(git log *)", "Bash(git blame *)"]) expect(tools).toContain(t);
+  });
+
+  it("the why command may run the same", () => {
+    const tools = (frontmatter("commands/why.md")["allowed-tools"] ?? "").split(",").map((t) => t.trim());
+    for (const t of ["Bash(node *)", "Bash(git show *)", "Bash(git log *)", "Bash(git blame *)"]) expect(tools).toContain(t);
+  });
 });
 
 describe("dist launchers", () => {

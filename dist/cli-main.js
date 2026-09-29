@@ -1759,6 +1759,15 @@ function blameAt(repoRoot2, relPath, start, end, rev, timeoutMs = 1e4) {
   }
   return parseBlamePorcelain(out, relPath);
 }
+function isoInZone(unixSeconds, tz) {
+  const m = /^([+-])(\d{2})(\d{2})$/.exec(tz.trim());
+  const offsetMin = m ? (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : 0;
+  const local = new Date((unixSeconds + offsetMin * 60) * 1e3).toISOString().slice(0, 19);
+  const sign = offsetMin < 0 ? "-" : "+";
+  const abs = Math.abs(offsetMin);
+  const zone = `${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+  return `${local}${zone}`;
+}
 function parseBlamePorcelain(out, relPath) {
   const meta = /* @__PURE__ */ new Map();
   const result = [];
@@ -1782,7 +1791,7 @@ function parseBlamePorcelain(out, relPath) {
     else if (line.startsWith("filename ")) m.path = toPosix(unquotePath2(line.slice(9)));
     else if (line.startsWith("	")) {
       if (!meta.has(pending.sha)) {
-        const date = m.time ? new Date(m.time * 1e3).toISOString() : "";
+        const date = m.time ? isoInZone(m.time, m.tz) : "";
         meta.set(pending.sha, { author: m.author, date, summary: m.summary, path: m.path });
       }
       const info = meta.get(pending.sha);
