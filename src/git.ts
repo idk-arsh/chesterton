@@ -4,12 +4,46 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 export class GitError extends Error {}
 
+let resolved: { path: string; git: string | null } | null = null;
+
+/**
+ * The git executable to start. On Windows, Node before 22 looks for a bare command name in the
+ * working directory before PATH, and git always runs with the repo as its working directory, so a
+ * `git.exe` committed at the root of a cloned repo would run instead of the real git. So on Windows
+ * git is looked up by hand in the absolute PATH entries, and null (no git) when it is not there.
+ * Elsewhere the name is fine: execvp only searches PATH.
+ */
+export function gitExecutable(): string | null {
+  if (process.platform !== "win32") return "git";
+  const path = process.env.PATH ?? "";
+  if (resolved && resolved.path === path) return resolved.git;
+  let git: string | null = null;
+  for (const raw of path.split(";")) {
+    const dir = raw.trim().replace(/^"(.*)"$/, "$1");
+    if (!dir || !isAbsolute(dir)) continue;
+    // Without a shell only real executables can start, so .cmd and .bat do not count.
+    const hit = [".exe", ".com"].map((ext) => join(dir, `git${ext}`)).find(isFile);
+    if (hit) {
+      git = hit;
+      break;
+    }
+  }
+  resolved = { path, git };
+  return git;
+}
+
+function gitOrThrow(): string {
+  const git = gitExecutable();
+  if (!git) throw new GitError("git was not found on PATH");
+  return git;
+}
+
 /**
  * Run git synchronously and return stdout. Throws GitError on non-zero exit or timeout.
  * Sync on purpose: the hook is a short-lived process and sync keeps control flow simple.
  */
 export function runGit(args: string[], cwd: string, timeoutMs = 10_000): string {
-  const res = spawnSync("git", ["-c", "core.quotepath=off", ...args], {
+  const res = spawnSync(gitOrThrow(), ["-c", "core.quotepath=off", ...args], {
     cwd,
     encoding: "utf8",
     timeout: timeoutMs,
@@ -151,7 +185,7 @@ export function repoRoot(cwd: string): string | null {
 
 /** Like runGit, but feeds `input` to git's stdin (for `--stdin` style commands). Throws GitError on failure. */
 export function runGitWithInput(args: string[], cwd: string, input: string, timeoutMs = 10_000): string {
-  const res = spawnSync("git", ["-c", "core.quotepath=off", ...args], {
+  const res = spawnSync(gitOrThrow(), ["-c", "core.quotepath=off", ...args], {
     cwd,
     input,
     encoding: "utf8",

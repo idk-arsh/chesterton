@@ -206,7 +206,7 @@ export function loadIndex(repoRoot: string): ChestertonIndex | null {
     const manifest = loadManifest(dir, meta);
     const commits = manifest && loadCommits(dir, meta);
     if (!manifest || !commits) return null;
-    const files: Record<string, FileFixRecord[]> = {};
+    const files: Record<string, FileFixRecord[]> = Object.create(null);
     for (const [path, name] of Object.entries(manifest.files)) {
       const shard = loadShard(dir, name, path);
       if (!shard) return null;
@@ -231,10 +231,10 @@ export function loadIndexForFiles(repoRoot: string, relPaths: string[], opts: { 
     const manifest = loadManifest(dir, meta);
     if (!manifest) return null;
     const commits: Record<string, FixCommit> = {};
-    const files: Record<string, FileFixRecord[]> = {};
+    const files: Record<string, FileFixRecord[]> = Object.create(null);
     for (const p of relPaths) {
       const key = normKey(p);
-      if (files[key]) continue;
+      if (Object.prototype.hasOwnProperty.call(files, key)) continue;
       const name = Object.prototype.hasOwnProperty.call(manifest.files, key) ? manifest.files[key] : undefined;
       if (!name) continue;
       const shard = loadShard(dir, name, key);
@@ -303,7 +303,8 @@ export function saveIndex(repoRoot: string, idx: ChestertonIndex): void {
   mkdirSync(shardDir, { recursive: true });
   const id = `${Date.now().toString(36)}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const manifest: Manifest = { version: INDEX_VERSION, id, files: {} };
+  // No prototype on files, so a path like `__proto__` is stored like any other.
+  const manifest: Manifest = { version: INDEX_VERSION, id, files: Object.create(null) };
   for (const [path, records] of Object.entries(idx.files)) {
     const commits: Record<string, FixCommit> = {};
     for (const r of records) {

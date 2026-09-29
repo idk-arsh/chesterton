@@ -5,6 +5,7 @@ import { hashLine, isTrivial, normalizeLine, splitLines, toPosix } from "./norma
 import { blameAt } from "./diff-change.js";
 import type { ChestertonIndex, FixCommit } from "./types.js";
 import { capList } from "./decide.js";
+import { recordsForFile } from "./index-store.js";
 
 const ZERO_SHA = /^0+$/;
 const HISTORY_LIMIT = 10;
@@ -80,7 +81,7 @@ export function explainLine(repoRoot: string, relPath: string, line: number, idx
   const norm = normalizeLine(text);
   if (idx && !isTrivial(norm)) {
     const h = hashLine(norm);
-    const adders = (idx.files[path] ?? [])
+    const adders = recordsForFile(idx, path)
       .filter((r) => r.added.some((a) => a.hash === h))
       .map((r) => idx.commits[r.sha])
       .filter((c): c is FixCommit => c !== undefined && !fixes.some((f) => f.sha === c.sha));

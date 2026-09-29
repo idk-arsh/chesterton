@@ -9,8 +9,31 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 var GitError = class extends Error {
 };
+var resolved = null;
+function gitExecutable() {
+  if (process.platform !== "win32") return "git";
+  const path = process.env.PATH ?? "";
+  if (resolved && resolved.path === path) return resolved.git;
+  let git = null;
+  for (const raw of path.split(";")) {
+    const dir = raw.trim().replace(/^"(.*)"$/, "$1");
+    if (!dir || !isAbsolute(dir)) continue;
+    const hit = [".exe", ".com"].map((ext) => join(dir, `git${ext}`)).find(isFile);
+    if (hit) {
+      git = hit;
+      break;
+    }
+  }
+  resolved = { path, git };
+  return git;
+}
+function gitOrThrow() {
+  const git = gitExecutable();
+  if (!git) throw new GitError("git was not found on PATH");
+  return git;
+}
 function runGit(args, cwd, timeoutMs = 1e4) {
-  const res = spawnSync("git", ["-c", "core.quotepath=off", ...args], {
+  const res = spawnSync(gitOrThrow(), ["-c", "core.quotepath=off", ...args], {
     cwd,
     encoding: "utf8",
     timeout: timeoutMs,
@@ -115,7 +138,7 @@ function repoRoot(cwd) {
   return locateRepo(cwd)?.root ?? null;
 }
 function runGitWithInput(args, cwd, input, timeoutMs = 1e4) {
-  const res = spawnSync("git", ["-c", "core.quotepath=off", ...args], {
+  const res = spawnSync(gitOrThrow(), ["-c", "core.quotepath=off", ...args], {
     cwd,
     input,
     encoding: "utf8",
@@ -375,6 +398,35 @@ function asInt(v) {
   const n = Number(t);
   return Number.isSafeInteger(n) ? n : null;
 }
+function hasNestedRepeat(src) {
+  const stack = [false];
+  const repeatAt = (i) => {
+    const c = src[i];
+    if (c === "*" || c === "+") return true;
+    const m = c === "{" ? /^\{(\d+)(,(\d*))?\}/.exec(src.slice(i)) : null;
+    if (!m) return false;
+    const max = m[2] === void 0 ? Number(m[1]) : m[3] === "" ? Infinity : Number(m[3]);
+    return max > 1;
+  };
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === "\\") {
+      i++;
+    } else if (c === "[") {
+      for (i++; i < src.length && src[i] !== "]"; i++) if (src[i] === "\\") i++;
+    } else if (c === "(") {
+      stack.push(false);
+    } else if (c === ")") {
+      const inner = stack.length > 1 ? stack.pop() : false;
+      const repeated = repeatAt(i + 1);
+      if (inner && repeated) return true;
+      stack[stack.length - 1] = stack[stack.length - 1] || inner || repeated;
+    } else if (repeatAt(i)) {
+      stack[stack.length - 1] = true;
+    }
+  }
+  return false;
+}
 function parseConfig(text) {
   const { values, warnings } = parseYamlSubset(text);
   const cfg = {
@@ -424,10 +476,15 @@ function parseConfig(text) {
         for (const src of list) {
           try {
             new RegExp(src, "i");
-            cfg.fixPatternsExtra.push(src);
           } catch {
             warnings.push(`fix_patterns_extra: "${src}" is not a valid regex, skipped`);
+            continue;
           }
+          if (hasNestedRepeat(src)) {
+            warnings.push(`fix_patterns_extra: "${src}" repeats a group that already repeats, which can take forever to match, skipped`);
+            continue;
+          }
+          cfg.fixPatternsExtra.push(src);
         }
         break;
       }
@@ -822,7 +879,7 @@ function loadIndex(repoRoot2) {
     const manifest = loadManifest(dir, meta);
     const commits = manifest && loadCommits(dir, meta);
     if (!manifest || !commits) return null;
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const [path, name] of Object.entries(manifest.files)) {
       const shard = loadShard(dir, name, path);
       if (!shard) return null;
@@ -841,10 +898,10 @@ function loadIndexForFiles(repoRoot2, relPaths, opts = {}) {
     const manifest = loadManifest(dir, meta);
     if (!manifest) return null;
     const commits = {};
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const p of relPaths) {
       const key = normKey(p);
-      if (files[key]) continue;
+      if (Object.prototype.hasOwnProperty.call(files, key)) continue;
       const name = Object.prototype.hasOwnProperty.call(manifest.files, key) ? manifest.files[key] : void 0;
       if (!name) continue;
       const shard = loadShard(dir, name, key);
@@ -897,7 +954,7 @@ function saveIndex(repoRoot2, idx) {
   const shardDir = join3(dir, SHARD_DIR);
   mkdirSync(shardDir, { recursive: true });
   const id = `${Date.now().toString(36)}-${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const manifest = { version: INDEX_VERSION, id, files: {} };
+  const manifest = { version: INDEX_VERSION, id, files: /* @__PURE__ */ Object.create(null) };
   for (const [path, records] of Object.entries(idx.files)) {
     const commits = {};
     for (const r of records) {
@@ -1338,7 +1395,7 @@ function buildIndexDetailed(repoRoot2, cfg, opts = {}) {
     touchLock(lock);
     const forward = /* @__PURE__ */ new Map();
     const resolvePath = (p) => forward.has(p) ? forward.get(p) : p;
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     const add = (key, rec) => {
       (files[key] ??= []).push(rec);
     };
@@ -1503,11 +1560,12 @@ function analyzeChange(repoRoot2, change, idx, cfg, deps = {}) {
   return findings;
 }
 function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLineCount) {
+  const survivors = survivingLines(removed, change.added);
   if (!deps.alwaysBlame) {
     if (records.length === 0) return [];
     const addedHashes = /* @__PURE__ */ new Set();
     for (const rec of records) for (const e of rec.added) addedHashes.add(e.hash);
-    if (!removed.some((r) => addedHashes.has(hashLine(r.norm)))) return [];
+    if (!removed.some((r) => !survivors.has(r.line) && addedHashes.has(hashLine(r.norm)))) return [];
   }
   const blame = deps.blame ?? blameRange;
   const maxLine = Math.max(fileLineCount, ...removed.map((r) => r.line));
@@ -1543,7 +1601,7 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     const hash = hashLine(r.norm);
     if (bl && isFixSha(bl.sha)) {
       const recs = recordsBySha.get(bl.sha) ?? [];
-      const strong = recs.some((rec) => rec.added.some((e) => e.hash === hash));
+      const strong = !survivors.has(r.line) && recs.some((rec) => rec.added.some((e) => e.hash === hash));
       hits.push({ kind: "removes-fix", strength: strong ? "strong" : "weak", sha: bl.sha, lines: [r.text.trim()] });
       if (strong) continue;
     }
@@ -1560,6 +1618,22 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     }
   }
   return hits;
+}
+function survivingLines(removed, added) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const a of added) {
+    const n = normalizeLine(a);
+    if (!isTrivial(n)) counts.set(n, (counts.get(n) ?? 0) + 1);
+  }
+  const out = /* @__PURE__ */ new Set();
+  for (const r of removed) {
+    const left = counts.get(r.norm) ?? 0;
+    if (left > 0) {
+      counts.set(r.norm, left - 1);
+      out.add(r.line);
+    }
+  }
+  return out;
 }
 function readdsRemoved(change, records, currentLines) {
   const present = /* @__PURE__ */ new Set();
@@ -1875,7 +1949,7 @@ function explainLine(repoRoot2, relPath, line, idx) {
   const norm = normalizeLine(text);
   if (idx && !isTrivial(norm)) {
     const h = hashLine(norm);
-    const adders = (idx.files[path] ?? []).filter((r) => r.added.some((a) => a.hash === h)).map((r) => idx.commits[r.sha]).filter((c) => c !== void 0 && !fixes.some((f) => f.sha === c.sha));
+    const adders = recordsForFile(idx, path).filter((r) => r.added.some((a) => a.hash === h)).map((r) => idx.commits[r.sha]).filter((c) => c !== void 0 && !fixes.some((f) => f.sha === c.sha));
     if (adders.length > 0) {
       out.push("Fix commits that added this exact line:");
       for (const c of adders) {
@@ -1932,9 +2006,23 @@ function day(iso) {
   return iso ? iso.slice(0, 10) : "unknown date";
 }
 
+// src/watchdog.ts
+import { Worker } from "node:worker_threads";
+function armWatchdog(ms) {
+  try {
+    const code = 'const { workerData: d } = require("node:worker_threads");setTimeout(() => { try { process.kill(d.pid, "SIGKILL"); } catch {} }, d.ms);';
+    const w = new Worker(code, { eval: true, workerData: { pid: process.pid, ms } });
+    w.on("error", () => {
+    });
+    w.unref();
+  } catch {
+  }
+}
+
 // src/cli.ts
 var VERSION = "0.1.0";
 var DEFAULT_LOCK_WAIT_MS = 6e4;
+var INDEX_WATCHDOG_MS = 10 * 6e4;
 var LOCK_POLL_MS = 250;
 var HELP = `chesterton ${VERSION}
 Stops Claude from quietly undoing past bug fixes.
@@ -2044,6 +2132,7 @@ function cmdIndex(io, full, quiet) {
     return 2;
   }
   const started = Date.now();
+  io.watchdog?.(INDEX_WATCHDOG_MS);
   try {
     const cfg = loadConfig(root);
     const { index: idx, outcome } = buildIndexDetailed(root, cfg, { full });
@@ -2071,7 +2160,7 @@ function parseFileLine(args) {
     lineText = args[1];
   } else {
     const a = args[0];
-    const m = /^(.*?):(\d+)(?::\d+)?$/.exec(a);
+    const m = /^(.*?)(?::|\s+)(\d+)(?::\d+)?$/.exec(a);
     if (!m) throw new UsageError(`expected <file>:<line>, got "${a}"`);
     file = m[1];
     lineText = m[2];
@@ -2295,7 +2384,8 @@ function defaultIO() {
 `),
     err: (t) => process.stderr.write(t.endsWith("\n") ? t : `${t}
 `),
-    cwd: process.cwd()
+    cwd: process.cwd(),
+    watchdog: armWatchdog
   };
 }
 function isEntryPoint() {
@@ -2311,6 +2401,7 @@ if (isEntryPoint()) {
   process.exitCode = main(process.argv.slice(2));
 }
 export {
+  INDEX_WATCHDOG_MS,
   VERSION,
   formatFinding,
   main,

@@ -9,7 +9,7 @@ Explain why this line exists: `$ARGUMENTS`
 1. Run this command with the Bash tool and read its output:
 
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" why $ARGUMENTS
+   node "${CLAUDE_PLUGIN_ROOT}/dist/cli.js" why "$ARGUMENTS"
    ```
 
    If no argument was given, or it is not in `file:line` form, ask for one and stop.

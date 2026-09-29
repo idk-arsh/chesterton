@@ -11,7 +11,13 @@ const MAX_LOGGED = 500;
 
 // ---------- glob matching ----------
 
-function globToRegExp(glob: string): RegExp {
+/**
+ * Glob pieces: DIRS is "**" plus a slash (nothing, or anything ending in a slash), ANY is "**",
+ * STAR is "*" (no slash), ONE is "?" (one character, not a slash), LIT is a literal character.
+ */
+type GlobToken = { t: "DIRS" | "ANY" | "STAR" | "ONE" } | { t: "LIT"; c: string };
+
+function tokenizeGlob(glob: string): GlobToken[] {
   let g = glob.trim().replace(/\\/g, "/");
   if (g.startsWith("./")) g = g.slice(2);
   if (g.startsWith("/")) g = g.slice(1);
@@ -19,32 +25,66 @@ function globToRegExp(glob: string): RegExp {
   if (g.endsWith("/")) g += "**";
   // A pattern with no slash matches the basename anywhere, like .gitignore.
   if (!g.includes("/")) g = `**/${g}`;
-  let re = "";
+  const out: GlobToken[] = [];
   for (let i = 0; i < g.length; i++) {
     const c = g[i]!;
     if (c === "*") {
       if (g[i + 1] === "*") {
         const slashAfter = g[i + 2] === "/";
         i += slashAfter ? 2 : 1;
-        re += slashAfter ? "(?:.*/)?" : ".*";
+        const t = slashAfter ? "DIRS" : "ANY";
+        // "**/**/" is the same as "**/".
+        if (!(t === "DIRS" && out[out.length - 1]?.t === "DIRS")) out.push({ t });
       } else {
-        re += "[^/]*";
+        out.push({ t: "STAR" });
       }
     } else if (c === "?") {
-      re += "[^/]";
+      out.push({ t: "ONE" });
     } else {
-      re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      out.push({ t: "LIT", c });
     }
   }
-  return new RegExp(`^${re}$`);
+  return out;
+}
+
+/**
+ * Whole-path glob match by dynamic programming, so the time is tokens times path length whatever
+ * the pattern. A regex backtracks exponentially on patterns like "**" + "/**" repeated, and
+ * `protect` comes from a config file inside the repo.
+ */
+function globMatches(tokens: GlobToken[], s: string): boolean {
+  const n = s.length;
+  // next[i] is 1 when the tokens after the current one match s.slice(i).
+  let next = new Uint8Array(n + 1);
+  next[n] = 1;
+  for (let ti = tokens.length - 1; ti >= 0; ti--) {
+    const tok = tokens[ti]!;
+    const cur = new Uint8Array(n + 1);
+    // DIRS: a slash at or after i is followed by a match of the rest.
+    let slashAhead = 0;
+    for (let i = n; i >= 0; i--) {
+      const ch = i < n ? s[i] : "";
+      let ok = 0;
+      if (tok.t === "LIT") ok = i < n && ch === tok.c ? next[i + 1]! : 0;
+      else if (tok.t === "ONE") ok = i < n && ch !== "/" ? next[i + 1]! : 0;
+      else if (tok.t === "STAR") ok = next[i]! || (i < n && ch !== "/" ? cur[i + 1]! : 0);
+      else if (tok.t === "ANY") ok = next[i]! || (i < n ? cur[i + 1]! : 0);
+      else {
+        if (i < n && ch === "/" && next[i + 1]) slashAhead = 1;
+        ok = next[i]! || slashAhead;
+      }
+      cur[i] = ok ? 1 : 0;
+    }
+    next = cur;
+  }
+  return next[0] === 1;
 }
 
 /** Minimal glob match on repo-relative posix paths. Supports **, * and ?. */
 export function matchGlob(relPath: string, glob: string): boolean {
   if (!glob.trim()) return false;
   try {
-    const re = globToRegExp(glob);
-    if (re.test(relPath)) return true;
+    if (globMatches(tokenizeGlob(glob), relPath)) return true;
     // "src/auth" should also cover files under it.
     return !/[*?]/.test(glob) && relPath.startsWith(glob.replace(/\\/g, "/").replace(/\/+$/, "") + "/");
   } catch {

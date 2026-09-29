@@ -162,6 +162,9 @@ describe("bundled hook process", () => {
       format: "esm",
       logLevel: "silent",
     });
+    // The bundle is ESM, like dist/ next to the plugin's package.json. Node before 22 does not
+    // guess the module type, so say it.
+    writeFileSync(join(bundleDir, "package.json"), '{"type":"module"}');
   }, 60_000);
   afterAll(() => {
     if (bundleDir) rmSync(bundleDir, { recursive: true, force: true });

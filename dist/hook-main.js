@@ -99,8 +99,31 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 var GitError = class extends Error {
 };
+var resolved = null;
+function gitExecutable() {
+  if (process.platform !== "win32") return "git";
+  const path = process.env.PATH ?? "";
+  if (resolved && resolved.path === path) return resolved.git;
+  let git = null;
+  for (const raw of path.split(";")) {
+    const dir = raw.trim().replace(/^"(.*)"$/, "$1");
+    if (!dir || !isAbsolute(dir)) continue;
+    const hit = [".exe", ".com"].map((ext) => join(dir, `git${ext}`)).find(isFile);
+    if (hit) {
+      git = hit;
+      break;
+    }
+  }
+  resolved = { path, git };
+  return git;
+}
+function gitOrThrow() {
+  const git = gitExecutable();
+  if (!git) throw new GitError("git was not found on PATH");
+  return git;
+}
 function runGit(args, cwd, timeoutMs = 1e4) {
-  const res = spawnSync("git", ["-c", "core.quotepath=off", ...args], {
+  const res = spawnSync(gitOrThrow(), ["-c", "core.quotepath=off", ...args], {
     cwd,
     encoding: "utf8",
     timeout: timeoutMs,
@@ -375,6 +398,35 @@ function asInt(v) {
   const n = Number(t);
   return Number.isSafeInteger(n) ? n : null;
 }
+function hasNestedRepeat(src) {
+  const stack = [false];
+  const repeatAt = (i) => {
+    const c = src[i];
+    if (c === "*" || c === "+") return true;
+    const m = c === "{" ? /^\{(\d+)(,(\d*))?\}/.exec(src.slice(i)) : null;
+    if (!m) return false;
+    const max = m[2] === void 0 ? Number(m[1]) : m[3] === "" ? Infinity : Number(m[3]);
+    return max > 1;
+  };
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === "\\") {
+      i++;
+    } else if (c === "[") {
+      for (i++; i < src.length && src[i] !== "]"; i++) if (src[i] === "\\") i++;
+    } else if (c === "(") {
+      stack.push(false);
+    } else if (c === ")") {
+      const inner = stack.length > 1 ? stack.pop() : false;
+      const repeated = repeatAt(i + 1);
+      if (inner && repeated) return true;
+      stack[stack.length - 1] = stack[stack.length - 1] || inner || repeated;
+    } else if (repeatAt(i)) {
+      stack[stack.length - 1] = true;
+    }
+  }
+  return false;
+}
 function parseConfig(text) {
   const { values, warnings } = parseYamlSubset(text);
   const cfg = {
@@ -424,10 +476,15 @@ function parseConfig(text) {
         for (const src of list) {
           try {
             new RegExp(src, "i");
-            cfg.fixPatternsExtra.push(src);
           } catch {
             warnings.push(`fix_patterns_extra: "${src}" is not a valid regex, skipped`);
+            continue;
           }
+          if (hasNestedRepeat(src)) {
+            warnings.push(`fix_patterns_extra: "${src}" repeats a group that already repeats, which can take forever to match, skipped`);
+            continue;
+          }
+          cfg.fixPatternsExtra.push(src);
         }
         break;
       }
@@ -562,10 +619,10 @@ function loadIndexForFiles(repoRoot2, relPaths, opts = {}) {
     const manifest = loadManifest(dir, meta);
     if (!manifest) return null;
     const commits = {};
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const p of relPaths) {
       const key = normKey(p);
-      if (files[key]) continue;
+      if (Object.prototype.hasOwnProperty.call(files, key)) continue;
       const name = Object.prototype.hasOwnProperty.call(manifest.files, key) ? manifest.files[key] : void 0;
       if (!name) continue;
       const shard = loadShard(dir, name, key);
@@ -1285,11 +1342,12 @@ function analyzeChange(repoRoot2, change, idx, cfg, deps = {}) {
   return findings;
 }
 function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLineCount) {
+  const survivors = survivingLines(removed, change.added);
   if (!deps.alwaysBlame) {
     if (records.length === 0) return [];
     const addedHashes = /* @__PURE__ */ new Set();
     for (const rec of records) for (const e of rec.added) addedHashes.add(e.hash);
-    if (!removed.some((r) => addedHashes.has(hashLine(r.norm)))) return [];
+    if (!removed.some((r) => !survivors.has(r.line) && addedHashes.has(hashLine(r.norm)))) return [];
   }
   const blame = deps.blame ?? blameRange;
   const maxLine = Math.max(fileLineCount, ...removed.map((r) => r.line));
@@ -1325,7 +1383,7 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     const hash = hashLine(r.norm);
     if (bl && isFixSha(bl.sha)) {
       const recs = recordsBySha.get(bl.sha) ?? [];
-      const strong = recs.some((rec) => rec.added.some((e) => e.hash === hash));
+      const strong = !survivors.has(r.line) && recs.some((rec) => rec.added.some((e) => e.hash === hash));
       hits.push({ kind: "removes-fix", strength: strong ? "strong" : "weak", sha: bl.sha, lines: [r.text.trim()] });
       if (strong) continue;
     }
@@ -1342,6 +1400,22 @@ function removesFix(repoRoot2, change, removed, records, idx, cfg, deps, fileLin
     }
   }
   return hits;
+}
+function survivingLines(removed, added) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const a of added) {
+    const n = normalizeLine(a);
+    if (!isTrivial(n)) counts.set(n, (counts.get(n) ?? 0) + 1);
+  }
+  const out = /* @__PURE__ */ new Set();
+  for (const r of removed) {
+    const left = counts.get(r.norm) ?? 0;
+    if (left > 0) {
+      counts.set(r.norm, left - 1);
+      out.add(r.line);
+    }
+  }
+  return out;
 }
 function readdsRemoved(change, records, currentLines) {
   const present = /* @__PURE__ */ new Set();
@@ -1390,36 +1464,61 @@ function readdsRemoved(change, records, currentLines) {
 
 // src/decide.ts
 var MAX_LOGGED = 500;
-function globToRegExp(glob) {
+function tokenizeGlob(glob) {
   let g = glob.trim().replace(/\\/g, "/");
   if (g.startsWith("./")) g = g.slice(2);
   if (g.startsWith("/")) g = g.slice(1);
   if (g.endsWith("/")) g += "**";
   if (!g.includes("/")) g = `**/${g}`;
-  let re = "";
+  const out = [];
   for (let i = 0; i < g.length; i++) {
     const c = g[i];
     if (c === "*") {
       if (g[i + 1] === "*") {
         const slashAfter = g[i + 2] === "/";
         i += slashAfter ? 2 : 1;
-        re += slashAfter ? "(?:.*/)?" : ".*";
+        const t = slashAfter ? "DIRS" : "ANY";
+        if (!(t === "DIRS" && out[out.length - 1]?.t === "DIRS")) out.push({ t });
       } else {
-        re += "[^/]*";
+        out.push({ t: "STAR" });
       }
     } else if (c === "?") {
-      re += "[^/]";
+      out.push({ t: "ONE" });
     } else {
-      re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      out.push({ t: "LIT", c });
     }
   }
-  return new RegExp(`^${re}$`);
+  return out;
+}
+function globMatches(tokens, s) {
+  const n = s.length;
+  let next = new Uint8Array(n + 1);
+  next[n] = 1;
+  for (let ti = tokens.length - 1; ti >= 0; ti--) {
+    const tok = tokens[ti];
+    const cur = new Uint8Array(n + 1);
+    let slashAhead = 0;
+    for (let i = n; i >= 0; i--) {
+      const ch = i < n ? s[i] : "";
+      let ok = 0;
+      if (tok.t === "LIT") ok = i < n && ch === tok.c ? next[i + 1] : 0;
+      else if (tok.t === "ONE") ok = i < n && ch !== "/" ? next[i + 1] : 0;
+      else if (tok.t === "STAR") ok = next[i] || (i < n && ch !== "/" ? cur[i + 1] : 0);
+      else if (tok.t === "ANY") ok = next[i] || (i < n ? cur[i + 1] : 0);
+      else {
+        if (i < n && ch === "/" && next[i + 1]) slashAhead = 1;
+        ok = next[i] || slashAhead;
+      }
+      cur[i] = ok ? 1 : 0;
+    }
+    next = cur;
+  }
+  return next[0] === 1;
 }
 function matchGlob(relPath, glob) {
   if (!glob.trim()) return false;
   try {
-    const re = globToRegExp(glob);
-    if (re.test(relPath)) return true;
+    if (globMatches(tokenizeGlob(glob), relPath)) return true;
     return !/[*?]/.test(glob) && relPath.startsWith(glob.replace(/\\/g, "/").replace(/\/+$/, "") + "/");
   } catch {
     return false;
@@ -1662,7 +1761,7 @@ function loadBaseline(repoRoot2, sessionId) {
     const raw = JSON.parse(readFileSync7(baselinePath(repoRoot2, sessionId), "utf8"));
     if (!raw || typeof raw !== "object" || typeof raw.at !== "string" || typeof raw.complete !== "boolean") return null;
     if (!raw.files || typeof raw.files !== "object" || Array.isArray(raw.files)) return null;
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     for (const [k, v] of Object.entries(raw.files)) {
       if (typeof v === "string" || v === null) files[k] = v;
     }
@@ -1744,7 +1843,7 @@ function handleHookInput(raw, deps = {}) {
     const sessionId = typeof input.session_id === "string" && input.session_id ? input.session_id : "default";
     if (event === "PreToolUse") {
       const deadline = new Deadline(startedAt + cfg.hookTimeoutMs);
-      return preToolUse(root, cfg, sessionId, input, deadline);
+      return preToolUse(root, cfg, sessionId, input, deadline, deps.blame ?? blameRange);
     }
     if (event === "SessionStart") {
       return sessionStart(root, sessionId, deps);
@@ -1832,7 +1931,7 @@ function snapshotDirty(root, sessionId) {
   try {
     if (loadBaseline(root, sessionId)) return;
     const dirty = dirtyFiles(root, 3e3);
-    const files = {};
+    const files = /* @__PURE__ */ Object.create(null);
     let hashed = 0;
     for (const f of dirty.slice(0, MAX_BASELINE_FILES)) {
       files[f] = hashed++ < MAX_BASELINE_HASHED ? contentHash(root, f) : null;
@@ -1842,7 +1941,7 @@ function snapshotDirty(root, sessionId) {
     logError(root, err);
   }
 }
-function preToolUse(root, cfg, sessionId, input, deadline) {
+function preToolUse(root, cfg, sessionId, input, deadline, blameFn) {
   const tool = typeof input.tool_name === "string" ? input.tool_name : "";
   if (!EDIT_TOOLS.has(tool)) return null;
   const changes = changeFromToolCall(root, tool, input.tool_input);
@@ -1858,7 +1957,7 @@ function preToolUse(root, cfg, sessionId, input, deadline) {
       session.files.push(change.relPath);
       if (session.files.length > MAX_SESSION_FILES) session.files.splice(0, session.files.length - MAX_SESSION_FILES);
     }
-    const findings = idx ? analyzeChange(root, change, idx, cfg, { timeoutMs: deadline.budget() }) : fallbackFindings(root, change, cfg, deadline);
+    const findings = idx ? analyzeChange(root, change, idx, cfg, { blame: (r, p, s, e) => blameFn(r, p, s, e, deadline.budget()) }) : fallbackFindings(root, change, cfg, deadline, blameFn);
     deadline.check();
     const res = decidePreToolUse(findings, session, cfg, change.relPath);
     if (res.stdout && !out) out = res.stdout;
@@ -1932,9 +2031,9 @@ function addedLinesInCommit(root, sha, path, timeoutMs) {
   }
   return out;
 }
-function fallbackFindings(root, change, cfg, deadline) {
+function fallbackFindings(root, change, cfg, deadline, blameFn) {
   if (change.isNewFile || change.removed.length === 0) return [];
-  const blame = memoBlame(deadline);
+  const blame = memoBlame(deadline, blameFn);
   const empty = { version: INDEX_VERSION, head: "", builtAt: "", commits: {}, files: {} };
   const removalOnly = { ...change, added: [] };
   analyzeChange(root, removalOnly, empty, cfg, { blame: blame.fn, alwaysBlame: true });
@@ -1962,7 +2061,7 @@ function fallbackFindings(root, change, cfg, deadline) {
   }
   if (Object.keys(idx.commits).length === 0) return [];
   deadline.check();
-  return analyzeChange(root, removalOnly, idx, cfg, { blame: blame.fn, alwaysBlame: true });
+  return analyzeChange(root, change, idx, cfg, { blame: blame.fn, alwaysBlame: true });
 }
 function parseNumstat(text) {
   const out = [];
